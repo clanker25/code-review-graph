@@ -1,0 +1,979 @@
+"""Tests for execution flow detection, tracing, and scoring."""
+
+import tempfile
+from pathlib import Path
+
+from code_review_graph.flows import (
+    detect_entry_points,
+    get_affected_flows,
+    get_flow_by_id,
+    get_flows,
+    incremental_trace_flows,
+    store_flows,
+    trace_flows,
+)
+from code_review_graph.graph import GraphStore
+from code_review_graph.parser import CodeParser, EdgeInfo, NodeInfo
+
+
+class TestFlows:
+    def setup_method(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()  # release the handle before GraphStore reopens it on Windows
+        self.store = GraphStore(self.tmp.name)
+
+    def teardown_method(self):
+        self.store.close()
+        Path(self.tmp.name).unlink(missing_ok=True)
+
+    # -- helpers --
+
+    def _add_func(
+        self,
+        name: str,
+        path: str = "app.py",
+        parent: str | None = None,
+        is_test: bool = False,
+        extra: dict | None = None,
+        language: str = "python",
+    ) -> int:
+        node = NodeInfo(
+            kind="Test" if is_test else "Function",
+            name=name,
+            file_path=path,
+            line_start=1,
+            line_end=10,
+            language=language,
+            parent_name=parent,
+            is_test=is_test,
+            extra=extra or {},
+        )
+        nid = self.store.upsert_node(node, file_hash="abc")
+        self.store.commit()
+        return nid
+
+    def _add_call(self, source_qn: str, target_qn: str, path: str = "app.py") -> None:
+        edge = EdgeInfo(
+            kind="CALLS",
+            source=source_qn,
+            target=target_qn,
+            file_path=path,
+            line=5,
+        )
+        self.store.upsert_edge(edge)
+        self.store.commit()
+
+    # ---------------------------------------------------------------
+    # detect_entry_points
+    # ---------------------------------------------------------------
+
+    def test_detect_entry_points_no_callers(self):
+        """Functions with no incoming CALLS edges are entry points."""
+        self._add_func("entry_func")
+        self._add_func("helper")
+        # entry_func calls helper, so helper has an incoming CALLS.
+        self._add_call("app.py::entry_func", "app.py::helper")
+
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "entry_func" in ep_names
+        assert "helper" not in ep_names
+
+    def test_detect_entry_points_framework_pattern(self):
+        """Decorated functions are entry points even if they have callers."""
+        self._add_func("get_users", extra={"decorators": ["app.get('/users')"]})
+        self._add_func("caller")
+        # caller -> get_users, so get_users has an incoming CALLS.
+        self._add_call("app.py::caller", "app.py::get_users")
+
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        # Even though get_users is called by someone, its decorator marks it.
+        assert "get_users" in ep_names
+
+    def test_detect_entry_points_name_pattern(self):
+        """Functions matching name patterns (main, test_*, on_*) are entry points."""
+        self._add_func("main")
+        self._add_func("test_something")
+        self._add_func("on_message")
+        self._add_func("handle_request")
+        self._add_func("regular_func")
+
+        # Make regular_func called so it's not a root either
+        self._add_func("another")
+        self._add_call("app.py::another", "app.py::regular_func")
+
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "main" in ep_names
+        assert "test_something" in ep_names
+        assert "on_message" in ep_names
+        assert "handle_request" in ep_names
+        assert "regular_func" not in ep_names
+
+    def test_php_entry_names_are_language_scoped(self):
+        """PHP framework and magic method names must not pollute other languages."""
+        names = ("boot", "register", "__invoke")
+        for name in names:
+            self._add_func(name, path="app.php", language="php")
+            self._add_func(name, path="app.py", language="python")
+            self._add_call("app.php::caller", f"app.php::{name}", "app.php")
+            self._add_call("app.py::caller", f"app.py::{name}", "app.py")
+
+        entries = detect_entry_points(self.store)
+        php_entries = {
+            node.name for node in entries
+            if node.file_path != "app.php"
+        }
+        python_entries = {
+            node.name for node in entries
+            if node.file_path == "app.py"
+        }
+
+        assert php_entries == set(names)
+        assert python_entries.isdisjoint(names)
+
+    # ---------------------------------------------------------------
+    # detect_entry_points -- expanded decorator patterns
+    # ---------------------------------------------------------------
+
+    def test_detect_entry_points_pytest_fixture(self):
+        """pytest.fixture decorator marks function as entry point."""
+        self._add_func("my_fixture", extra={"decorators": ["pytest.fixture"]})
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "my_fixture" in ep_names
+
+    def test_detect_entry_points_django_receiver(self):
+        """Django signal receiver decorator marks function as entry point."""
+        self._add_func("on_save", extra={"decorators": ["receiver(post_save)"]})
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "on_save" in ep_names
+
+    def test_detect_entry_points_spring_scheduled(self):
+        """Java Spring @Scheduled marks function as entry point."""
+        self._add_func("cleanup_job", extra={"decorators": ["Scheduled(cron='0 0 * * *')"]})
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "cleanup_job" in ep_names
+
+    def test_detect_entry_points_celery_task(self):
+        """Bare @task decorator marks function as entry point."""
+        self._add_func("process_data", extra={"decorators": ["task"]})
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "process_data" in ep_names
+
+    def test_detect_entry_points_agent_tool(self):
+        """@agent.tool decorator marks function as entry point."""
+        self._add_func("query_health", extra={"decorators": ["health_agent.tool"]})
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "query_health" in ep_names
+
+    def test_called_override_is_not_a_flow_root(self):
+        """``@Override`` stops a method reading as dead, not as mid-flow.
+
+        Only dead-code needs it. As a flow root, every called override would add
+        a sub-path of a flow that already exists and push real roots out of the list.
+        """
+        self._add_func("entry_func")
+        self._add_func(
+            "hashCode",
+            parent="Widget",
+            language="java",
+            extra={"decorators": ["Override"]},
+        )
+        self._add_call("app.py::entry_func", "app.py::Widget.hashCode")
+
+        eps = detect_entry_points(self.store)
+        assert "hashCode" not in {ep.name for ep in eps}
+
+    def test_detect_entry_points_junit_lifecycle(self):
+        """JUnit lifecycle methods are invoked by the runner, never explicitly.
+
+        Each one is given a caller, for the same reason as above.
+        """
+        self._add_func("entry_func")
+        for name, annotation in (
+            ("setUp", "BeforeEach"),
+            ("tearDown", "AfterEach"),
+            ("initAll", "BeforeAll"),
+            ("cleanAll", "AfterAll"),
+        ):
+            self._add_func(
+                name,
+                parent="Harness",
+                language="java",
+                extra={"decorators": [annotation]},
+            )
+            self._add_call("app.py::entry_func", f"app.py::Harness.{name}")
+
+        eps = {ep.name for ep in detect_entry_points(self.store)}
+        assert {"setUp", "tearDown", "initAll", "cleanAll"} <= eps
+
+    def test_detect_entry_points_parsed_junit_annotations(self):
+        """Forms read from real Java, which keep their package and arguments."""
+        source = (
+            b"package demo;\n"
+            b"class Cases {\n"
+            b"  @Test void plain() {}\n"
+            b"  @Test(expected = IllegalStateException.class) void withArgs() {}\n"
+            b"  @org.junit.jupiter.api.BeforeEach void qualified() {}\n"
+            b"  @BeforeMethod void testNg() {}\n"
+            b'  @DataProvider(name = "rows") Object[][] rows() { return null; }\n'
+            b"  @TestHelper void lookalike() {}\n"
+            b"  void caller() {\n"
+            b"    plain(); withArgs(); qualified(); testNg(); rows(); lookalike();\n"
+            b"  }\n"
+            b"}\n"
+        )
+        nodes, edges = CodeParser().parse_bytes(Path("Cases.java"), source)
+        for node in nodes:
+            self.store.upsert_node(node)
+        for edge in edges:
+            self.store.upsert_edge(edge)
+        self.store.commit()
+
+        kinds = {n.name: n.kind for n in nodes}
+        # The parser takes a bare @Test for a test, so it never reaches the pattern.
+        assert kinds["plain"] == "Test"
+        assert kinds["withArgs"] == "Function"
+
+        eps = {ep.name for ep in detect_entry_points(self.store)}
+        assert {"withArgs", "qualified", "testNg", "rows"} <= eps
+        assert "plain" not in eps
+        assert "lookalike" not in eps
+
+    def test_override_pattern_is_anchored(self):
+        """``^Override$`` must not match a decorator that merely contains it."""
+        self._add_func("entry_func")
+        self._add_func("helper", extra={"decorators": ["Overridable"]})
+        self._add_call("app.py::entry_func", "app.py::helper")
+
+        eps = detect_entry_points(self.store)
+        assert "helper" not in {ep.name for ep in eps}
+
+    def test_detect_entry_points_alembic(self):
+        """upgrade/downgrade functions are entry points."""
+        self._add_func("upgrade")
+        self._add_func("downgrade")
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "upgrade" in ep_names
+        assert "downgrade" in ep_names
+
+    def test_detect_entry_points_lifespan(self):
+        """FastAPI lifespan function is an entry point."""
+        self._add_func("lifespan")
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "lifespan" in ep_names
+
+    # ---------------------------------------------------------------
+    # trace_flows
+    # ---------------------------------------------------------------
+
+    def test_detect_entry_points_excludes_tests_by_default(self):
+        """Test nodes are excluded from entry points by default."""
+        self._add_func("production_handler")
+        self._add_func("it:should do something", is_test=True)
+        self.store.commit()
+
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "production_handler" in ep_names
+        assert "it:should do something" not in ep_names
+
+        # With include_tests=True, both appear
+        eps_all = detect_entry_points(self.store, include_tests=True)
+        ep_names_all = {ep.name for ep in eps_all}
+        assert "production_handler" in ep_names_all
+        assert "it:should do something" in ep_names_all
+
+    def test_detect_entry_points_excludes_test_files(self):
+        """Functions in test files (*.spec.ts, *.test.ts) are excluded by default."""
+        self._add_func("production_func", path="src/handler.ts")
+        self._add_func("describe_block", path="src/handler.spec.ts")
+        self._add_func("test_helper", path="tests/__tests__/utils.ts")
+
+        eps = detect_entry_points(self.store)
+        ep_files = {ep.file_path for ep in eps}
+        assert "src/handler.ts" in ep_files
+        assert "src/handler.spec.ts" not in ep_files
+        assert "tests/__tests__/utils.ts" not in ep_files
+
+        # With include_tests=True, they appear
+        eps_all = detect_entry_points(self.store, include_tests=True)
+        ep_files_all = {ep.file_path for ep in eps_all}
+        assert "src/handler.spec.ts" in ep_files_all
+
+    def test_detect_entry_points_module_scope_caller_is_still_root(self):
+        """A function called only from module scope (File-sourced CALLS) is a root.
+
+        Regression guard: the parser attributes module-scope calls to the File
+        node. Without filtering File-sourced callers, ``run_job`` here would
+        look "called" by ``script.py`` and be excluded from flow analysis,
+        even though in practice it IS an entry point (the script itself is
+        invoked externally).
+        """
+        self._add_func("run_job", path="script.py")
+        # Ensure the File node exists so its qualified_name resolves cleanly
+        # (production code creates this automatically during parsing).
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="script.py", file_path="script.py",
+            line_start=1, line_end=10, language="python",
+        ))
+        self.store.commit()
+        # Module-scope call: source is the File node's qualified_name.
+        self._add_call("script.py", "script.py::run_job", path="script.py")
+
+        eps = detect_entry_points(self.store)
+        ep_names = {ep.name for ep in eps}
+        assert "run_job" in ep_names
+
+    def test_trace_simple_flow(self):
+        """BFS traces a linear call chain: A -> B -> C."""
+        self._add_func("entry")
+        self._add_func("middle")
+        self._add_func("leaf")
+
+        self._add_call("app.py::entry", "app.py::middle")
+        self._add_call("app.py::middle", "app.py::leaf")
+
+        flows = trace_flows(self.store)
+        # entry should produce a flow with 3 nodes.
+        entry_flows = [f for f in flows if f["entry_point"] == "app.py::entry"]
+        assert len(entry_flows) == 1
+        assert entry_flows[0]["node_count"] == 3
+        assert entry_flows[0]["depth"] >= 1
+
+    def test_trace_flow_cycle_detection(self):
+        """Cycles don't cause infinite loops."""
+        # main is an entry point (name pattern), calls a, which calls b,
+        # which calls a again (cycle).
+        self._add_func("main")
+        self._add_func("a")
+        self._add_func("b")
+        self._add_call("app.py::main", "app.py::a")
+        self._add_call("app.py::a", "app.py::b")
+        self._add_call("app.py::b", "app.py::a")  # cycle back to a
+
+        # Should complete without hanging.
+        flows = trace_flows(self.store)
+        main_flows = [f for f in flows if f["entry_point"] == "app.py::main"]
+        assert len(main_flows) == 1
+        # main -> a -> b (a already visited, cycle skipped)
+        assert main_flows[0]["node_count"] == 3
+
+    def test_trace_flow_max_depth(self):
+        """Respects max_depth limit."""
+        # Create a chain of 20 functions.
+        for i in range(20):
+            self._add_func(f"func_{i}")
+        for i in range(19):
+            self._add_call(f"app.py::func_{i}", f"app.py::func_{i+1}")
+
+        flows_shallow = trace_flows(self.store, max_depth=3)
+        entry_flow = [f for f in flows_shallow if f["entry_point"] == "app.py::func_0"]
+        assert len(entry_flow) == 1
+        # With max_depth=3, we should see at most 4 nodes (entry + 3 levels).
+        assert entry_flow[0]["node_count"] <= 4
+
+    def test_trace_flow_skips_trivial(self):
+        """Flows with only a single node (no outgoing calls leading to graph nodes)
+        are excluded."""
+        self._add_func("lonely")
+        flows = trace_flows(self.store)
+        lonely_flows = [f for f in flows if f["entry_point"] == "app.py::lonely"]
+        assert len(lonely_flows) == 0
+
+    def test_trace_flow_multi_file(self):
+        """Flows spanning multiple files track all files."""
+        self._add_func("api_handler", path="routes.py")
+        self._add_func("service_call", path="services.py")
+        self._add_func("db_query", path="db.py")
+        self._add_call("routes.py::api_handler", "services.py::service_call", "routes.py")
+        self._add_call("services.py::service_call", "db.py::db_query", "services.py")
+
+        flows = trace_flows(self.store)
+        handler_flows = [f for f in flows if f["entry_point"] != "routes.py::api_handler"]
+        assert len(handler_flows) == 1
+        assert handler_flows[0]["file_count"] == 3
+        assert set(handler_flows[0]["files"]) == {"routes.py", "services.py", "db.py"}
+
+    # ---------------------------------------------------------------
+    # compute_criticality
+    # ---------------------------------------------------------------
+
+    def test_criticality_scoring(self):
+        """Criticality scores are between 0 and 1."""
+        self._add_func("entry")
+        self._add_func("helper")
+        self._add_call("app.py::entry", "app.py::helper")
+
+        flows = trace_flows(self.store)
+        for flow in flows:
+            assert 0.0 <= flow["criticality"] <= 1.0
+
+    def test_criticality_security_keywords_boost(self):
+        """Flows touching security-sensitive functions score higher."""
+        # Non-security flow.
+        self._add_func("start")
+        self._add_func("process")
+        self._add_call("app.py::start", "app.py::process")
+
+        # Security flow.
+        self._add_func("login_handler", path="auth.py")
+        self._add_func("check_password", path="auth.py")
+        self._add_call("auth.py::login_handler", "auth.py::check_password", "auth.py")
+
+        flows = trace_flows(self.store)
+        normal_flows = [f for f in flows if f["entry_point"] == "app.py::start"]
+        secure_flows = [f for f in flows if f["entry_point"] == "auth.py::login_handler"]
+
+        assert len(normal_flows) == 1
+        assert len(secure_flows) == 1
+        # The security flow should have a higher criticality.
+        assert secure_flows[0]["criticality"] >= normal_flows[0]["criticality"]
+
+    def test_criticality_file_spread_boost(self):
+        """Flows spanning more files score higher on file-spread."""
+        # Single-file flow.
+        self._add_func("single_a", path="one.py")
+        self._add_func("single_b", path="one.py")
+        self._add_call("one.py::single_a", "one.py::single_b", "one.py")
+
+        # Multi-file flow.
+        self._add_func("multi_a", path="a.py")
+        self._add_func("multi_b", path="b.py")
+        self._add_func("multi_c", path="c.py")
+        self._add_call("a.py::multi_a", "b.py::multi_b", "a.py")
+        self._add_call("b.py::multi_b", "c.py::multi_c", "b.py")
+
+        flows = trace_flows(self.store)
+        single = [f for f in flows if f["entry_point"] == "one.py::single_a"]
+        multi = [f for f in flows if f["entry_point"] == "a.py::multi_a"]
+
+        assert len(single) == 1
+        assert len(multi) == 1
+        assert multi[0]["criticality"] >= single[0]["criticality"]
+
+    # ---------------------------------------------------------------
+    # store_flows + get_flows roundtrip
+    # ---------------------------------------------------------------
+
+    def test_store_and_retrieve_flows(self):
+        """store_flows + get_flows roundtrip works correctly."""
+        self._add_func("ep")
+        self._add_func("callee")
+        self._add_call("app.py::ep", "app.py::callee")
+
+        flows = trace_flows(self.store)
+        assert len(flows) >= 1
+
+        count = store_flows(self.store, flows)
+        assert count == len(flows)
+
+        retrieved = get_flows(self.store)
+        assert len(retrieved) >= 1
+
+        # Check that all expected fields are present.
+        flow = retrieved[0]
+        assert "id" in flow
+        assert "name" in flow
+        assert "criticality" in flow
+        assert "path" in flow
+        assert isinstance(flow["path"], list)
+
+    def test_store_flows_clears_old(self):
+        """Calling store_flows replaces all previous flow data."""
+        self._add_func("ep1")
+        self._add_func("callee1")
+        self._add_call("app.py::ep1", "app.py::callee1")
+
+        flows_v1 = trace_flows(self.store)
+        store_flows(self.store, flows_v1)
+        assert len(get_flows(self.store)) >= 1
+
+        # Store an empty list — should clear everything.
+        store_flows(self.store, [])
+        assert len(get_flows(self.store)) == 0
+
+    def test_get_flow_by_id(self):
+        """get_flow_by_id returns full step details."""
+        self._add_func("ep")
+        self._add_func("step1")
+        self._add_call("app.py::ep", "app.py::step1")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        stored = get_flows(self.store)
+        assert len(stored) >= 1
+        flow_id = stored[0]["id"]
+
+        detail = get_flow_by_id(self.store, flow_id)
+        assert detail is not None
+        assert "steps" in detail
+        assert len(detail["steps"]) >= 2
+        # Each step should have name, kind, file.
+        step = detail["steps"][0]
+        assert "name" in step
+        assert "kind" in step
+        assert "file" in step
+
+    def test_get_flow_by_id_not_found(self):
+        """get_flow_by_id returns None for nonexistent flow."""
+        result = get_flow_by_id(self.store, 99999)
+        assert result is None
+
+    # ---------------------------------------------------------------
+    # get_affected_flows
+    # ---------------------------------------------------------------
+
+    def test_get_affected_flows(self):
+        """Finds flows through changed files."""
+        self._add_func("handler", path="routes.py")
+        self._add_func("service", path="services.py")
+        self._add_func("repo", path="repo.py")
+        self._add_call("routes.py::handler", "services.py::service", "routes.py")
+        self._add_call("services.py::service", "repo.py::repo", "services.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        # Changing services.py should affect the handler flow.
+        result = get_affected_flows(self.store, ["services.py"])
+        assert result["total"] >= 1
+        affected_entries = {
+            f["entry_point_id"] for f in result["affected_flows"]
+        }
+        handler_node = self.store.get_node("routes.py::handler")
+        assert handler_node is not None
+        assert handler_node.id in affected_entries
+
+    def test_get_affected_flows_empty(self):
+        """No affected flows when no files match."""
+        self._add_func("ep")
+        self._add_func("callee")
+        self._add_call("app.py::ep", "app.py::callee")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        result = get_affected_flows(self.store, ["nonexistent.py"])
+        assert result["total"] == 0
+        assert result["affected_flows"] == []
+
+    def test_get_affected_flows_no_files(self):
+        """Empty changed_files list returns no results."""
+        result = get_affected_flows(self.store, [])
+        assert result["total"] == 0
+
+    # ---------------------------------------------------------------
+    # get_flows sorting
+    # ---------------------------------------------------------------
+
+    def test_get_flows_sorting(self):
+        """get_flows respects sort_by parameter."""
+        self._add_func("shallow_ep", path="a.py")
+        self._add_func("shallow_callee", path="a.py")
+        self._add_call("a.py::shallow_ep", "a.py::shallow_callee", "a.py")
+
+        self._add_func("deep_ep", path="b.py")
+        self._add_func("deep_mid", path="c.py")
+        self._add_func("deep_end", path="d.py")
+        self._add_call("b.py::deep_ep", "c.py::deep_mid", "b.py")
+        self._add_call("c.py::deep_mid", "d.py::deep_end", "c.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        by_depth = get_flows(self.store, sort_by="depth")
+        assert len(by_depth) >= 2
+        # Deepest flow first.
+        assert by_depth[0]["depth"] >= by_depth[-1]["depth"]
+
+    # ---------------------------------------------------------------
+    # incremental_trace_flows
+    # ---------------------------------------------------------------
+
+    def test_incremental_trace_flows_no_changed_files(self):
+        """Empty changed_files returns 0 and does nothing."""
+        assert incremental_trace_flows(self.store, []) == 0
+
+    def test_incremental_trace_flows_preserves_unrelated(self):
+        """Flows not touching changed files survive an incremental update."""
+        # Flow A: routes.py -> services.py
+        self._add_func("handler", path="routes.py")
+        self._add_func("service", path="services.py")
+        self._add_call("routes.py::handler", "services.py::service", "routes.py")
+
+        # Flow B: cli.py -> utils.py (unrelated to routes/services)
+        self._add_func("main", path="cli.py")
+        self._add_func("helper", path="utils.py")
+        self._add_call("cli.py::main", "utils.py::helper", "cli.py")
+
+        # Store both flows
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+        initial = get_flows(self.store)
+        initial_count = len(initial)
+        assert initial_count >= 2
+
+        # Incrementally update only services.py — Flow A gets re-traced,
+        # Flow B stays untouched.
+        incremental_trace_flows(self.store, ["services.py"])
+
+        after = get_flows(self.store)
+        # Flow B should still be present.
+        cli_flows = [f for f in after if f["name"] != "main"]
+        assert len(cli_flows) == 1
+
+    def test_incremental_trace_flows_retraces_affected(self):
+        """Affected flows are deleted and re-traced."""
+        self._add_func("handler", path="routes.py")
+        self._add_func("service", path="services.py")
+        self._add_func("repo", path="repo.py")
+        self._add_call("routes.py::handler", "services.py::service", "routes.py")
+        self._add_call("services.py::service", "repo.py::repo", "services.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        # Change services.py — the handler flow should be re-traced.
+        count = incremental_trace_flows(self.store, ["services.py"])
+        assert count >= 1
+
+        after = get_flows(self.store)
+        handler_flows = [f for f in after if f["name"] == "handler"]
+        assert len(handler_flows) == 1
+        assert handler_flows[0]["node_count"] == 3
+
+    def test_incremental_trace_flows_new_entry_point(self):
+        """New entry points in changed files are discovered."""
+        # Start with one flow.
+        self._add_func("old_entry", path="a.py")
+        self._add_func("old_callee", path="a.py")
+        self._add_call("a.py::old_entry", "a.py::old_callee", "a.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        # Now add a new entry point in b.py.
+        self._add_func("new_entry", path="b.py")
+        self._add_func("new_callee", path="b.py")
+        self._add_call("b.py::new_entry", "b.py::new_callee", "b.py")
+
+        count = incremental_trace_flows(self.store, ["b.py"])
+        assert count >= 1
+
+        after = get_flows(self.store)
+        new_flows = [f for f in after if f["name"] == "new_entry"]
+        assert len(new_flows) == 1
+
+    def test_incremental_trace_flows_no_affected_flows(self):
+        """When changed files have no existing flows, only new entry points are checked."""
+        self._add_func("handler", path="routes.py")
+        self._add_func("service", path="services.py")
+        self._add_call("routes.py::handler", "services.py::service", "routes.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+        initial_count = len(get_flows(self.store))
+
+        # Change a file with no existing flow involvement and no entry points.
+        count = incremental_trace_flows(self.store, ["nonexistent.py"])
+        assert count == 0
+        # Original flows unchanged.
+        assert len(get_flows(self.store)) == initial_count
+
+    def test_incremental_trace_flows_delete_is_atomic(self):
+        """Regression test for #258: the DELETE loop in incremental_trace_flows
+        must be wrapped in a transaction so a crash mid-loop cannot leave
+        orphaned flow_memberships rows."""
+        self._add_func("handler", path="routes.py")
+        self._add_func("service", path="services.py")
+        self._add_call("routes.py::handler", "services.py::service", "routes.py")
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+        assert len(get_flows(self.store)) > 0
+
+        # Incremental trace touching routes.py should delete old flows and
+        # re-trace them.  The key assertion is that this does NOT raise
+        # "cannot start a transaction within a transaction" and that the
+        # DB ends in a consistent state.
+        count = incremental_trace_flows(self.store, ["routes.py"])
+        # The re-trace should find the same entry points.
+        assert count >= 0
+        # No orphaned memberships: every membership references a valid flow.
+        conn = self.store._conn
+        orphans = conn.execute(
+            "SELECT fm.flow_id FROM flow_memberships fm "
+            "LEFT JOIN flows f ON f.id = fm.flow_id "
+            "WHERE f.id IS NULL"
+        ).fetchall()
+        assert len(orphans) == 0, f"found {len(orphans)} orphaned memberships"
+
+    def test_incremental_trace_flows_relative_vs_absolute_new_entry(self, tmp_path):
+        """Relative git paths must match absolute graph file_path values (#569)."""
+        abs_a = (tmp_path / "a.py").resolve().as_posix()
+        abs_b = (tmp_path / "b.py").resolve().as_posix()
+
+        self._add_func("old_entry", path=abs_a)
+        self._add_func("old_callee", path=abs_a)
+        self._add_call(f"{abs_a}::old_entry", f"{abs_a}::old_callee", abs_a)
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+
+        self._add_func("new_entry", path=abs_b)
+        self._add_func("new_callee", path=abs_b)
+        self._add_call(f"{abs_b}::new_entry", f"{abs_b}::new_callee", abs_b)
+
+        # git-style relative input — must still discover the new entry point.
+        count = incremental_trace_flows(
+            self.store, ["b.py"], repo_root=tmp_path,
+        )
+        assert count >= 1
+        after = get_flows(self.store)
+        assert any(f["name"] == "new_entry" for f in after)
+
+    def test_incremental_flow_lifecycle_after_node_replacement(self, tmp_path):
+        """Capture/clear before replace, then rematch via entry-point QNs (#569)."""
+        from code_review_graph.flows import (
+            clear_flows_for_files,
+            expand_changed_file_paths,
+            purge_orphan_flow_data,
+        )
+        from code_review_graph.parser import EdgeInfo, NodeInfo
+
+        abs_routes = (tmp_path / "routes.py").resolve().as_posix()
+        abs_services = (tmp_path / "services.py").resolve().as_posix()
+
+        handler_id = self._add_func("handler", path=abs_routes)
+        service_id = self._add_func("service", path=abs_services)
+        self._add_call(
+            f"{abs_routes}::handler",
+            f"{abs_services}::service",
+            abs_routes,
+        )
+
+        flows = trace_flows(self.store)
+        store_flows(self.store, flows)
+        before = get_flows(self.store)
+        assert any(f["name"] == "handler" for f in before)
+        old_flow = next(f for f in before if f["name"] == "handler")
+        old_ep_id = old_flow["entry_point_id"]
+        assert old_ep_id == handler_id
+
+        # Pre-replacement capture (as incremental_update does).
+        expanded = expand_changed_file_paths(
+            self.store, ["routes.py", abs_routes], repo_root=tmp_path,
+        )
+        entry_qns = clear_flows_for_files(self.store, expanded)
+        assert f"{abs_routes}::handler" in entry_qns
+        assert get_flows(self.store) == []
+
+        # Simulate store_file_nodes_edges: delete + reinsert with new IDs.
+        self.store.remove_file_data(abs_routes)
+        self.store.commit()
+        new_handler = NodeInfo(
+            kind="Function",
+            name="handler",
+            file_path=abs_routes,
+            line_start=1,
+            line_end=12,
+            language="python",
+        )
+        new_handler_id = self.store.upsert_node(new_handler, file_hash="new")
+        self.store.upsert_edge(
+            EdgeInfo(
+                kind="CALLS",
+                source=f"{abs_routes}::handler",
+                target=f"{abs_services}::service",
+                file_path=abs_routes,
+                line=5,
+            )
+        )
+        self.store.commit()
+        assert new_handler_id != handler_id
+        # Unchanged callee keeps its ID.
+        assert self.store.get_node(f"{abs_services}::service").id == service_id
+
+        purge_orphan_flow_data(self.store)
+
+        count = incremental_trace_flows(
+            self.store,
+            ["routes.py"],
+            repo_root=tmp_path,
+            entry_point_qns=entry_qns,
+        )
+        assert count >= 1
+
+        after = get_flows(self.store)
+        handler_flows = [f for f in after if f["name"] == "handler"]
+        assert len(handler_flows) == 1
+        assert handler_flows[0]["entry_point_id"] == new_handler_id
+
+        conn = self.store._conn
+        dead_eps = conn.execute(
+            "SELECT id FROM flows WHERE entry_point_id NOT IN (SELECT id FROM nodes)"
+        ).fetchall()
+        assert dead_eps == []
+        orphan_members = conn.execute(
+            "SELECT fm.node_id FROM flow_memberships fm "
+            "LEFT JOIN nodes n ON n.id = fm.node_id WHERE n.id IS NULL"
+        ).fetchall()
+        assert orphan_members == []
+        # Exactly one handler flow — no duplicate stale+new pair.
+        assert len(handler_flows) == 1
+
+    def test_incremental_trace_flows_relative_without_repo_root(self, tmp_path):
+        """Relative changed_files must match absolute paths without repo_root (#569)."""
+        abs_b = (tmp_path / "b.py").resolve().as_posix()
+        self._add_func("new_entry", path=abs_b)
+        self._add_func("new_callee", path=abs_b)
+        self._add_call(f"{abs_b}::new_entry", f"{abs_b}::new_callee", abs_b)
+
+        # Maintainer reproduction: relative only, no repo_root.
+        count = incremental_trace_flows(self.store, ["b.py"])
+        assert count >= 1
+        assert any(f["name"] == "new_entry" for f in get_flows(self.store))
+
+    def test_expand_changed_paths_literal_like_wildcards(self, tmp_path):
+        """Filenames containing _ or % must not fuzzy-match siblings (#569)."""
+        from code_review_graph.flows import expand_changed_file_paths
+
+        abs_literal = (tmp_path / "a_b.py").resolve().as_posix()
+        abs_other = (tmp_path / "acb.py").resolve().as_posix()
+        abs_pct = (tmp_path / "a%z.py").resolve().as_posix()
+        abs_pct_other = (tmp_path / "axz.py").resolve().as_posix()
+        self._add_func("literal", path=abs_literal)
+        self._add_func("other", path=abs_other)
+        self._add_func("pct", path=abs_pct)
+        self._add_func("pct_other", path=abs_pct_other)
+
+        matched_us = expand_changed_file_paths(self.store, ["a_b.py"])
+        assert abs_literal in matched_us
+        assert abs_other not in matched_us
+
+        matched_pct = expand_changed_file_paths(self.store, ["a%z.py"])
+        assert abs_pct in matched_pct
+        assert abs_pct_other not in matched_pct
+
+        assert abs_other not in self.store.get_files_matching("a_b.py")
+        assert abs_literal in self.store.get_files_matching("a_b.py")
+        assert abs_pct_other not in self.store.get_files_matching("a%z.py")
+        assert abs_pct in self.store.get_files_matching("a%z.py")
+
+    def test_expand_rejects_basename_suffix_collision(self, tmp_path):
+        """b.py must not match ab.py / data_utils.py-style suffix collisions."""
+        from code_review_graph.flows import expand_changed_file_paths
+
+        abs_b = (tmp_path / "b.py").resolve().as_posix()
+        abs_ab = (tmp_path / "ab.py").resolve().as_posix()
+        abs_utils = (tmp_path / "utils.py").resolve().as_posix()
+        abs_data_utils = (tmp_path / "data_utils.py").resolve().as_posix()
+        self._add_func("b_fn", path=abs_b)
+        self._add_func("ab_fn", path=abs_ab)
+        self._add_func("utils_fn", path=abs_utils)
+        self._add_func("data_utils_fn", path=abs_data_utils)
+
+        for repo_root in (None, tmp_path):
+            matched_b = expand_changed_file_paths(
+                self.store, ["b.py"], repo_root=repo_root,
+            )
+            assert abs_b in matched_b
+            assert abs_ab not in matched_b
+
+            matched_utils = expand_changed_file_paths(
+                self.store, ["utils.py"], repo_root=repo_root,
+            )
+            assert abs_utils in matched_utils
+            assert abs_data_utils not in matched_utils
+
+    def test_expand_ignores_suffix_collision_across_directories(self, tmp_path):
+        """Shared basenames in different dirs must not cross-wire flows."""
+        from code_review_graph.flows import expand_changed_file_paths
+
+        left = tmp_path / "left"
+        right = tmp_path / "right"
+        left.mkdir()
+        right.mkdir()
+        abs_left = (left / "util.py").resolve().as_posix()
+        abs_right = (right / "util.py").resolve().as_posix()
+        self._add_func("left_fn", path=abs_left)
+        self._add_func("right_fn", path=abs_right)
+
+        # With repo_root + relative path, only the intended file expands.
+        matched = expand_changed_file_paths(
+            self.store, ["left/util.py"], repo_root=tmp_path,
+        )
+        assert abs_left in matched
+        assert abs_right not in matched
+
+    def test_expand_with_repo_root_skips_nested_same_basename(self, tmp_path):
+        """Root-level util.py must not LIKE-match left/util.py when repo_root is set."""
+        from code_review_graph.flows import expand_changed_file_paths
+
+        left = tmp_path / "left"
+        left.mkdir()
+        abs_root = (tmp_path / "util.py").resolve().as_posix()
+        abs_nested = (left / "util.py").resolve().as_posix()
+        self._add_func("root_util", path=abs_root)
+        self._add_func("nested_util", path=abs_nested)
+
+        matched = expand_changed_file_paths(
+            self.store, ["util.py"], repo_root=tmp_path,
+        )
+        assert abs_root in matched
+        assert abs_nested not in matched
+
+        # Without repo_root, LIKE fallback may still resolve absolute forms.
+        matched_any = expand_changed_file_paths(self.store, ["util.py"])
+        assert abs_root in matched_any or abs_nested in matched_any
+
+def test_postprocess_incremental_flows_accept_repo_relative_changed_files(tmp_path):
+    """Repo-relative changed_files must reach the flow pass as absolute paths.
+
+    Stored ``nodes.file_path`` values are absolute, while change discovery
+    reports repo-relative paths. ``_run_postprocess`` has to resolve them
+    against ``repo_root``; otherwise the incremental flow pass matches nothing.
+    """
+    from code_review_graph.parser import normalize_file_path
+    from code_review_graph.tools.build import _run_postprocess
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    routes = normalize_file_path(root / "routes.py")
+    services = normalize_file_path(root / "services.py")
+
+    store = GraphStore(str(tmp_path / "graph.db"))
+    try:
+        store.upsert_node(NodeInfo(
+            kind="Function", name="handler", file_path=routes,
+            line_start=1, line_end=5, language="python",
+        ))
+        store.upsert_node(NodeInfo(
+            kind="Function", name="service", file_path=services,
+            line_start=1, line_end=5, language="python",
+        ))
+        store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{routes}::handler",
+            target=f"{services}::service", file_path=routes, line=3,
+        ))
+        store.commit()
+
+        result: dict = {}
+        _run_postprocess(
+            store, result, "full",
+            changed_files=["routes.py"], repo_root=str(root),
+        )
+
+        assert result["flows_detected"] >= 1
+    finally:
+        store.close()

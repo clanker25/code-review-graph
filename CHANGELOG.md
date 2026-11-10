@@ -1,0 +1,2453 @@
+# Changelog
+
+## [Unreleased]
+
+## [2.4.0] - 2026-11-10
+
+Two new platforms, MiMo Code and DeepSeek Harness, so `install` now supports
+18. HTML, XSLT, Liquid, JSON and plain YAML files are indexed, and so are
+`.cjs` and `.kts` files, which every build used to skip. The graph links calls,
+imports and tests more carefully: a call it could not check no longer looks
+like a real link, every call edge says how sure it is, calls to inherited
+methods and imports of workspace packages are followed, and `tests_for` finds
+Java, Ruby and PHP tests. The graph schema moves from 13 to 15. Several new
+settings are off unless you turn them on. Read *Upgrade notes* at the end of
+this section before you upgrade.
+
+### Added
+
+- DeepSeek Harness is a supported platform (#1100, #1101, thanks @sumingwang233).
+  `install --platform dsh` adds one `insert` entry for DSH's own MCP client to
+  `~/.dsh/cordis.patch.yml` (or `$DSH_HOME/cordis.patch.yml`), which every DSH
+  profile reads, and the graph block to `AGENTS.md`. Comments, `!!js` values and
+  other entries in the file are kept byte for byte, and `uninstall` takes the
+  entry out again. Plain `install` picks DSH up when its home folder exists.
+- HTML pages (`.html`, `.htm`) are indexed (#521). They used to give nothing at
+  all. Inline scripts are parsed as JavaScript or TypeScript with the page's own
+  line numbers, and a `<script src>` becomes an import of the local file, so
+  `importers_of` lists the pages that load a script. An `onclick` that calls a
+  function on the page becomes a call. A `div`, `section` or `article` with an id
+  becomes a new `DocSection` node, which you can find by its anchor or its first
+  heading. The body text is not indexed. Style blocks and heading anchors stay
+  out, and pages over 2 MB keep only their file node. Run `build` to pick up
+  pages in a graph you already have.
+- XSLT stylesheets (`.xsl`, `.xslt`) are indexed (#1052). Each template and
+  `xsl:function` becomes a `Function` node, named by its `name` or written as
+  `match=para mode=toc`. `xsl:import` and `xsl:include` become imports, and
+  `xsl:call-template` becomes a call. `xsl:apply-templates` is chosen from the
+  input document when the stylesheet runs, so it becomes a call only where its
+  `select` names a step or its `mode` narrows the choice. Where neither does, no
+  edge is added and `dynamic_apply_count` on the template says so. A template with
+  a `match`, named or not, is never reported as dead code. Run `build` to pick up
+  stylesheets in a graph you already have.
+- CI now installs every direct dependency at its declared minimum, on each
+  supported Python, and runs the test suite there. `tests/test_dependency_floors.py`
+  keeps `pyproject.toml` and the pinned list in step in both directions. (#896)
+- A `Dockerfile` that works with Docker and Podman, so the tool can run from a
+  container. It installs this source, includes Git, and runs as a non-root user.
+  Mount a repository at `/workspace`; the graph stays in that repository. It
+  stores `/workspace` paths, so use the container for later commands or rebuild
+  on the host. No image is published. See the README. (#1037)
+- Liquid templates (`.liquid`) are indexed. A template gets `Variable` nodes for
+  `assign` and `Output` nodes for `{{ ... }}`, and `render` and `include` link to
+  the `snippets/<name>.liquid` file, so `importers_of` answers who renders a
+  snippet and it counts towards impact. `raw`, `comment`, `doc`, `schema`,
+  `javascript` and `stylesheet` blocks, `#` comments and quoted text are not read
+  as code. Names hold no line number, so an edit above them does not rename them,
+  and a repeated name is one node that lists every line. `Output` nodes are found
+  by search only with `kind="Output"`: on Shopify's Dawn theme they otherwise took
+  all ten top hits for "product". (#878, #348)
+- `get_impact_radius_tool(detail_level="compact")` and `code-review-graph impact
+  --detail-level compact` return the blast radius as ranked repository-relative
+  file paths and counts, with no node or edge records. `max_files` (default 25,
+  at most 200) limits each file list without shrinking the traversal, and
+  changed files the graph has no nodes for are listed in `unmatched_files`. The
+  CLI can also ask for `--detail-level minimal`.
+- `build --enrich` and `update --enrich` resolve Python method calls on a
+  local variable with Jedi, from the `enrichment` extra (PR #823). For
+  `s = make()` then `s.authenticate()`, the CALLS edge to the bare name
+  `authenticate` then names `svc.py::OldService.authenticate`, so
+  `callers_of` and the impact radius find the call. Jedi was a declared
+  extra that no build ever ran. It is off unless you ask for it, with the
+  flag or `CRG_ENABLE_ENRICHMENT=1` (for hooks, the watcher and MCP builds),
+  because it is slow: on an 88-file Python repository a full build went from
+  about 5 to 32 seconds and resolved 43 more calls. Having the extra installed,
+  for example through `[all]`, changes nothing on its own: the graph and the
+  build time stay the same. `CRG_DISABLE_ENRICHMENT=1` keeps it off even
+  when asked for. With it on, `update` scans only the Python files it
+  re-parses, plus their dependents, whose edges it rewrites, and a target
+  with no node in the graph is never written.
+- `get_knowledge_gaps_tool` now reports `import_cycles`: groups of files that
+  import each other, with one loop written out and its import lines. `load_time`
+  says whether the loop can fail as the files load; `false` means every loop has
+  an import that runs late: inside a function, a dynamic `import()` or a Ruby
+  `autoload`. To tell these apart, import edges now record
+  `extra.import_context`: `type_only`, `deferred` or `parent_package`. Run
+  `code-review-graph build` once to get it on an existing graph. Part of #434.
+- `query_graph_tool` has a new `path_to` pattern that answers how one symbol or
+  file reaches another: `pattern="path_to", target="A", to="B"`, or
+  `code-review-graph query path_to A --to B`. Each hop says how sure it is, and
+  the answer names the weakest hop. A longer route through bound edges beats a
+  shorter one that guesses at a name.
+- `code-review-graph install --steering` adds an opt-in Claude Code hook that puts
+  graph context beside each search and read. `enrich` has existed for a long time,
+  but `install` never wrote the hook that runs it. It is off by default because it
+  changes what the model sees on every such call. `--no-steering` removes only
+  that hook, and `uninstall` removes it too. A failed lookup never stops the tool
+  call, and a broken graph or odd input now leaves `enrich` silent.
+- `serve --http --multi-repo` runs one HTTP server for every repository in the
+  registry, so the embedding model is loaded once (#607). Each tool call must
+  name a registered repository in `repo_root`. A call with no `repo_root`, a
+  relative path or a path that is not registered is refused with a clear
+  message. Before, a shared HTTP server quietly answered such a call from
+  `--repo` or its own working directory, which could be a repository the
+  client never named. The registry is read on every call, so `register` and
+  `unregister` take effect without a restart. The flag needs `--http` and
+  cannot be combined with `--repo`, `--auto-watch`, `--multi-worktree` or
+  `CRG_DATA_DIR`; the daemon still watches several repositories. stdio and
+  plain `serve --http` are unchanged.
+- An opt-in local log of context savings, and a `context-history` command to
+  read it (#813). Set `CRG_CONTEXT_HISTORY=1` and every response that carries
+  a `context_savings` estimate (the impact, review-context, detect-changes and
+  compact architecture tools, and the `detect-changes`, `update --brief`,
+  `impact` and `architecture` commands) adds one JSON line to
+  `context-history.jsonl` next to `graph.db`: the time, the tool, the
+  estimated full, graph and saved tokens, and where the call has them
+  `detail_level`, the changed-file count and the depth. No file names, paths,
+  symbol names or source text are written, nothing is sent anywhere, and the
+  log rolls over at 1 MiB, so it never takes much more than 2 MiB. `code-review-graph
+  context-history` prints it per UTC day or, with `--by tool`, per tool, with
+  `--days N` and `--json`. Off by default; nothing is written in read-only
+  mode.
+- The GitHub Action has an opt-in `details` input that adds graph context
+  to the review comment (#882). It takes a list of sections: `risk` shows
+  each term of the top symbols' risk scores, so a reader sees why a score
+  moved and not only that it did; `communities`, `hubs` and `coupling` show
+  the communities the change touches, its most connected symbols and the
+  links that cross a community or language boundary; `impact` shows its
+  impact radius and direct callers; `gaps` ranks the test gaps by what
+  depends on them; `graph` gives the graph's size, community count, the
+  method that found the communities (Leiden or file-based grouping), and
+  versions. The block is folded away, shows at most 5 rows per list, is
+  capped at 12,000 bytes with a note saying what was cut, and never takes
+  room from the report. Left empty, the default, the Action runs the same
+  commands and posts the same comment byte for byte. The data comes from the
+  new `code-review-graph detect-changes --details <sections>` option, which
+  adds a `details` object to the JSON and nothing else. Building communities
+  now also records the method used, in graph metadata.
+- Symlinked folders can be followed, as an opt-in (#269). Pass
+  `--follow-symlinks` to `build`, `update` or `watch`, or set
+  `CRG_FOLLOW_SYMLINKS=1`; it is off by default, so nothing changes unless you
+  ask. A project folder of links to code kept elsewhere
+  (`inputs/app -> ~/src/app`) now builds a graph instead of an empty one.
+  Links to folders outside the repository are followed too, because you made
+  the link and asked for it, and their files are stored under the link's path
+  inside the repository, never the outside path. A file inside the repository
+  keeps its own path, so a link to a folder the graph already holds adds no
+  copies. A link to a folder that holds it, or holds the repository, is
+  skipped and logged, and each real folder is read once, so links cannot
+  loop. At most `CRG_MAX_FOLLOWED_FILES` files (default 10,000) are taken, and
+  a warning says when the cap is reached. `update` and `watch` add and drop
+  these files as links and the files behind them come and go, matching a full
+  build; `watch` also watches each followed folder outside the repository.
+  Search, review context, flows, rename and `forget` work on these files
+  through their in-repo path, and imports between them point there too. Any
+  other path outside the repository is still refused, and the review context
+  and flow source snippets no longer read one either. Symlinked files are
+  still never followed.
+- Python modules that replace themselves in `sys.modules` are followed to the
+  module they install. A compatibility shim such as
+  `sys.modules[__name__] = importlib.import_module("app.services.billing")`
+  hands importers `app/services/billing.py`, but the graph stopped at the shim:
+  `import billing` targeted the shim file, `billing.charge(...)` and the
+  `TESTED_BY` edge from a test calling it stayed unresolved because `charge`
+  is not defined in the shim, and `from billing import charge` named a node
+  that does not exist. The import edge, module-receiver calls and
+  `from shim import name` now resolve to the real module, through chains of
+  shims and through re-exports to the defining file. Only the literal,
+  module-level form is followed; a computed or relative module name, a swap
+  inside a block, or a target outside the repository leaves the file as the
+  module. Because importers now depend on the real module, editing only the
+  shim does not re-parse them on `update`; run `build` after re-pointing a
+  shim.
+- `semantic_search_nodes_tool` can return the code with the hits.
+  `include_source=True` attaches each hit's source lines, and
+  `expand_neighbors=True` also attaches the direct callers and callees of the
+  top hits with their source. `max_source_lines` caps each snippet, one
+  line budget caps the whole response, cut-off snippets are marked
+  `source_truncated`, and a stored path that resolves outside the repository
+  is never read. Source is not attached when `detail_level="minimal"`. Without this an agent got names and line numbers and opened
+  the same files by hand, so the search cost tokens on top of the reads
+  instead of replacing them.
+- The README and `docs/REPRODUCING.md` publish the first canonical
+  `agent_baseline` capture (2026-09-22): against a grep-and-read-top-3-files
+  baseline, the graph answer is a median 6.65x smaller across 18 questions on
+  6 repositories (range 4.2x to 72.6x). It predates the test-file ranking
+  below, so a run today gives different numbers until it is redone. The
+  per-repo CSVs are in `evaluate/results/`; the 2026-05-25 `impact_accuracy`
+  CSVs are removed, as the 2026-08-02 captures replace them.
+- Codex installs a global CRG skill with MCP-first guidance and a read-only CLI fallback (#841).
+- `install` also writes `post-checkout`, `post-merge` and `post-rewrite` git
+  hooks that run `update`, so the graph follows a branch switch, a merge or a
+  `git pull` (merge or rebase mode) instead of waiting for the next commit.
+  `post-checkout` runs on branch checkouts only and skips the checkout a
+  rebase makes before replaying local commits; `post-rewrite` updates once the
+  rebase has finished and ignores `--amend`, which `pre-commit` already covers.
+  A rebase with nothing to replay never runs `post-rewrite`, so it updates at
+  that checkout. An existing hook in a language other than shell is left alone.
+  Each block is marked, appended to an existing hook, skipped in linked
+  worktrees unless `CRG_HOOK_WORKTREES=1`, and removed by `uninstall`.
+  `--no-hooks` skips them along with `pre-commit`.
+- Oracle PL/SQL files get structural parsing: packages, procedures, functions and the calls between them (#785).
+- Robot Framework `.robot` and `.resource` files are indexed (#967, #963).
+- Static Laravel routes produce `Endpoint` nodes and `HANDLES` edges at parse time (#1072, part of #851).
+- Spring AOP advice reaches its targets through `@annotation` and `execution` pointcuts (#916, #592).
+- `serve` has an opt-in mode for parallel graph access across Git worktrees (#1063).
+- Read-only MCP tools carry `readOnlyHint`, so clients can skip the approval prompt (#1124, #1123).
+- The troubleshooting guide explains the local-checkout workaround for Zed SSH projects (#1130).
+- `.json` files are indexed; before, they gave no nodes at all (part of #436).
+  Each key and array shape becomes a `JsonPath` node joined by `CONTAINS`
+  edges, in the same value-free shape as generic YAML: array items share one
+  `[*]` path, and values never enter the graph. Comments and trailing commas,
+  as in `tsconfig.json`, are fine. JSON is often data, so a lot stays out:
+  translation files keep only a file node by the rule YAML uses (#1150), and
+  so do test files, files under `docs`, `examples`, `samples`, `demo` or
+  `data` folders, and files over 256 KB. A file stops at 1,000 paths, and an
+  object with more than 200 keys shares one `.*` path. `package-lock.json`,
+  `npm-shrinkwrap.json`, `*.lock.json`, `project.assets.json` and `*.min.json`
+  are ignored. On vega, 473 JSON files add 1,228 paths, mostly its 37
+  `package.json` files; without the folder rule, `docs/` alone would have
+  added 12,725. Search ranks JSON below code unless you ask for it with
+  `kind="JsonPath"`, a `$` path or a `.json` name, and JSON rows no longer
+  take the places code needs: six `translation.json` files had pushed
+  `appWithTranslation` out of the hits for "translation" on next-i18next.
+  `detect_changes_tool` reports `changed_json_paths`. A JSON or YAML key
+  escaped to a lone surrogate, such as `"\ud800"`, is left out; before, a
+  YAML one stopped the whole build. Run `build` to add JSON to a graph you
+  already have.
+- MiMo Code is a supported platform (#593, PR #688 by @Aditya-Tripuraneni).
+  `install --platform mimo` adds the server under `mcp` in
+  `.mimocode/mimocode.jsonc` if that file exists, otherwise in
+  `.mimocode/mimocode.json`, and writes the graph instructions to `AGENTS.md`.
+  Other servers, settings and comments are kept. MiMo reads both files, so
+  `uninstall` removes the entry from both.
+
+### Changed
+
+- Dependency minimums are raised to versions that are tested and that install
+  on every supported Python: `mcp>=1.29.0`, `anyio>=4.8.0`, `tree-sitter>=0.26.0`,
+  `tree-sitter-language-pack>=0.13.0` and `pyyaml>=6.0.2`. PyYAML 6.0 fails to
+  build on Python 3.12 and newer, and `mcp` 1.29 and `fastmcp` 3.2.4 already need
+  a newer `anyio` than the old minimum of 4.0. Ranges stay ranges; pin exact
+  versions in your own lockfile if you need them. (#896, #265)
+- `staging` is no longer promoted to `testing` automatically. The `Auto promote` workflow and its script are gone, so a person reviews and merges every promotion, and a test fails if any workflow merges a pull request.
+- Generic `.yml` and `.yaml` files are indexed as `YamlPath` nodes that hold key
+  paths and value types, never values. `detect_changes` reports them as
+  `changed_yaml_paths`, bounded by `max_results`; the analysis behind it takes
+  at most `CRG_MAX_CHANGED_YAML_PATHS` (200) YAML paths, and as many JSON
+  paths. `pnpm-lock.yaml` is ignored at
+  any depth.
+- Search ranks test code below production code unless the query asks about
+  tests (`kind="Test"`, or a word such as "test", "spec", "fixture" or
+  "mock"). A two-line test stub that names a symbol used to score as well as
+  the implementation and could outrank it.
+- The installed instruction block tells agents to answer from
+  `include_source=True, expand_neighbors=True` and open a file only when a
+  snippet is cut off. It still says not to change code from graph output
+  alone. Earlier blocks stay recognised for upgrade and uninstall.
+- The MCP server instructions now route by question type instead of introducing
+  the server as a code-review tool. With deferred tool loading an agent sees
+  only the tool names and these instructions, so "for code reviews" kept it on
+  Grep for callers, importers and covering tests everywhere else. The new text
+  maps each relationship question to its tool and leaves plain-text search to
+  Grep. Measured with Claude Code on one TypeScript monorepo: across 8 ordinary
+  tasks that never mention the graph (implement, review, brainstorm, plan), the
+  graph was used in 1 run before and 6 after; plain-text questions stayed on
+  Grep (0 of 4 moved). `tests/test_server_instructions.py` keeps every tool and
+  query pattern the text names registered.
+- Stored vectors are scored with numpy when it is installed, about 20 times faster, and numpy stays optional (#1090, #1089).
+- `CRG_VECTOR_CACHE=1` keeps the decoded embedding vectors in memory between
+  searches instead of reading them all back from SQLite on every query. A
+  search over 42,000 vectors of 4,096 dimensions goes from 2.3 s to 0.40 s once
+  the cache is warm, with the same ranking. It is off by default because it
+  costs RAM and holds a read connection open for the life of the process, and
+  on Windows that keeps `graph.db` from being deleted or replaced.
+- `find_dead_code` collects its edge evidence once, not once per function (#1082, #982).
+- Plain C headers skip the C++ parse through a prefilter (#876, #802).
+- The dev dependency range allows pytest 9 (#1140).
+- Builds and updates use less memory and fewer database commits. The MCP server loads its tool modules on first use, so an idle server holds about 89 MB instead of 144 MB; new flows, flow members and summary rows are written in one transaction each; the files that depend on a changed file come from one query; and community detection no longer decodes every edge's metadata. The graph itself is unchanged (#1139).
+- fastmcp 4 is allowed (`fastmcp>=3.2.4,<5`) and `uv.lock` pins 4.1.6 (#970).
+  fastmcp 4 brings the mcp SDK 2.x, so the server now answers
+  `server/discover` and serves clients on the 2026-07-28 protocol, which
+  issue #919 found it could not do. Older clients still use the
+  `initialize` handshake as before. The prompts import `Message` from
+  `fastmcp.prompts`, which works on fastmcp 3 and 4; the old
+  `fastmcp.prompts.prompt` path is gone in 4 and stopped the server from
+  starting.
+- The `build-graph`, `review-delta` and `review-pr` skills are written from one source, `DOCUMENTARY_SKILLS` in `skills.py`. `scripts/generate_documentary_skills.py` rewrites them, and a test fails if a file is edited by hand (#822).
+- `install --gitignore` adds the files and folders that run created to a
+  marked block in the repository's `.gitignore` (#471). It is off by default,
+  because `.claude/`, `.mcp.json` and `CLAUDE.md` can be team files. Only
+  paths that did not exist before the run and that git does not track are
+  listed, so a file you wrote or committed is never ignored. A path some rule
+  already ignores is not repeated. Running install again merges into the same
+  block, `--dry-run` shows the lines it would add, and `uninstall` removes the
+  block and nothing else, so `.gitignore` comes back byte for byte. The
+  `.code-review-graph/` entry keeps its own handling.
+
+### Fixed
+
+- A fresh clone, set up as CONTRIBUTING.md says, now passes and stays clean:
+  - Installing for any platform inside this checkout no longer leaves untracked
+    files. The root `.gitignore` now lists what Cursor, Windsurf, Gemini CLI,
+    Kiro, MiMo, OpenCode, CodeBuddy and Copilot write there, and
+    `tests/test_install_outputs_are_ignored.py` fails if a platform starts
+    writing a new path.
+  - `tests/test_token_budget.py` no longer fails when the temp folder has a
+    long path (the macOS default, or a long `--basetemp`). Answers hold
+    absolute paths, so each one is now measured as if the test repo lived at
+    the path CI gives it. No budget changed.
+  - One parser test failed on Python 3.14, which `uv sync` picks when it is
+    the newest Python installed. Python 3.14 parses the long expression the
+    test used to break `ast.parse`, so the test now forces the failure on any
+    Python that accepts it. The rest of the suite already passed on 3.14.
+- The release gate's corpus check expects this release's numbers. Its recorded
+  baselines dated from before the new YAML, JSON, HTML and Liquid support, Ruby
+  and Java test finding, and the C# and nested-scope identity changes, so 3 of
+  its 8 repositories reported moves that were on purpose. The time budgets are
+  unchanged.
+- The determinism check reorders the file list again. Since `build` started
+  reading the file list through a new function, the check's reorder never
+  reached it, so the three file-order tests built the same order twice: two
+  passed for no reason and the known node-id bug looked fixed, which failed the
+  release gate. The check now reorders the function `build` uses, and fails if a
+  reordered build never read the reordered list.
+- The docs match the code again. `docs/`, the reference `get_docs_section_tool`
+  serves, `CONTRIBUTING.md`, `SECURITY.md`, `AGENTS.md`, the Copilot
+  instructions, two skills and the VS Code README now cover what the last two
+  release trains added: all 19 query patterns, the search source options, the
+  write lock and exit `75`, the new git and steering hooks, untracked files,
+  Liquid and the other new node kinds, confidence tiers and schema v15. They also
+  drop claims the code no longer backs.
+- The read-only query script in the bundled skill (`crg_readonly.py`) now
+  takes `path_to` with `--to`, so it offers every pattern the CLI `query`
+  command accepts. It stops before running the CLI when `path_to` has no
+  `--to`. A test now fails if the script's list drifts from `tools/query.py`
+  or the CLI again; the patterns the CLI does not take yet are listed there
+  with the reason.
+- The VS Code `codeReviewGraph.cliPath` setting no longer talks about a bundled
+  version. The extension does not include the CLI; left empty, it runs
+  `code-review-graph` from your `PATH` (#369).
+- `install --dry-run` shows what each file would become, and `install` writes
+  nothing until you have answered its question (#173). The dry run used to list
+  file names only, and a real install wrote the MCP config before it asked
+  about `CLAUDE.md` and the other instruction files. Every install write (MCP
+  configs, `.gitignore`, skills, hooks, git hooks, the OpenCode plugin, the
+  instruction files, the `--steering` hook and the `--gitignore` block) now
+  goes into a plan first. `--dry-run` prints that plan
+  as one unified diff per file, a new file as its full content, cut at 60
+  lines a file with a note saying how many lines were left out, and writes
+  nothing. A real install lists the files it will change, asks about the
+  instruction files, and only then writes exactly the plan it showed. Ctrl-C
+  at the question stops the install with nothing written, and a file whose
+  content or permissions change while the question is open is left alone and
+  reported. A file reached by two names, such as `CLAUDE.md` linked to
+  `AGENTS.md`, is planned and written once. Commented JSONC configs and hook
+  settings are previewed and written through the same splice, so their
+  comments are kept. A hook settings file install will leave alone is named in
+  the dry run too. Saying no to the question also keeps the instruction files
+  out of the `--gitignore` block.
+- `query_graph_tool` no longer answers "ambiguous" when a full name has one
+  real symbol. The name search splits on underscores, so `hybrid_search` also
+  matched every `test_hybrid_search_*` and came back with 34 candidates and no
+  answer, at about 5,200 tokens even with `detail_level="minimal"`. A full name
+  now means that name: a test or test helper with the same name gives way to the
+  real symbol, and the summary says how many it skipped. Two real symbols with
+  the name are still ambiguous. The same query now costs about 450 tokens and
+  answers it. An ambiguous answer at `minimal` is five short rows sent once.
+- `callees_of` lists calls bound to a real node before bare-name guesses, so a
+  few `len` calls can no longer fill the window and hide the real callee.
+- `install` no longer wipes a hook settings file it cannot read as strict JSON.
+  One comment or trailing comma in `.claude/settings.json`, `.qoder/settings.json`,
+  `.codebuddy/settings.json`, `.gemini/settings.json`, `~/.codex/hooks.json` or
+  `~/.cursor/hooks.json` made the reader fail, and the file was overwritten with
+  nothing but our hooks and no backup, so every setting in it was lost. These
+  files are now read as JSONC, only what changed is written into a commented
+  file, and every comment stays with the setting it describes. A file that cannot
+  be merged, such as broken JSON or a `hooks` setting of the wrong shape, is left
+  byte for byte as it was and named in the output, and `install` no longer says
+  it installed those hooks. So is a file with a `/*` comment that never closes,
+  where the hooks would have landed inside the comment and never run. A refused
+  Gemini CLI install no longer rewrites the hook scripts in `.gemini/hooks/`.
+  Cursor's file now gets a `.bak` like the others.
+- Adding a member to a commented JSONC config, as `install` does for an MCP
+  entry, no longer moves a trailing comment onto the new member or drops a
+  comment from an empty object.
+- `.cjs` files are indexed as JavaScript and `.kts` files as Kotlin, as `.mjs`
+  and `.kt` already were. Every build skipped them, so their functions, imports
+  and calls were missing from the graph and read as if they did not exist.
+- `crg-daemon stop` clears the health and state files of watchers that were
+  killed outright. A killed watcher cannot clear its own, and on Windows that is
+  every watcher, because `stop` ends the daemon with `TerminateProcess` and the
+  Job Object takes the children with it. The file left behind read as a stalled
+  watcher forever. `stop` also now stops any live watcher when it finds the
+  daemon already gone. Health files for watchers the daemon never ran are left
+  alone.
+- Graphs no longer hold data nothing reads (#1059). Schema v15 drops
+  `community_summaries`, `flow_snapshots` and `risk_index`, which every full
+  postprocess rewrote and nothing read, and whose rows kept pointing at deleted
+  nodes. It also drops `idx_nodes_qualified`, `idx_edges_source` and
+  `idx_edges_target`, as other indexes cover them. A new graph of this repository
+  is 17% smaller, 252 MB down to 210 MB, with the same answers at the same speed.
+  An upgraded graph keeps its file size and reuses the freed space for later
+  writes; to shrink the file, delete it and rebuild, or run `VACUUM`. Older
+  releases refuse a v15 graph, as with any schema change. Build results no longer
+  carry `summaries_computed` or the `summaries_s` timing.
+- `find_large_functions_tool`, `semantic_search_nodes_tool` and
+  `traverse_graph_tool` now have hard ceilings. At a huge `limit` or
+  `token_budget` they returned up to 1.8M tokens on this repository, and now
+  return under 25,000. `limit` and `token_budget` reject zero, negatives and
+  booleans. The ceilings also bound the work: search ranks three times what it
+  shows, the large-functions query fetches only what it shows and counts the rest
+  in SQL, and the walk stops when the budget ends. `find_large_functions_tool`
+  gains `detail_level`, and `minimal` costs less than `standard`. `result_count`
+  on these tools now means the count before the cut, as on `query_graph_tool`.
+  (#895, #888)
+- `CRG_MAX_IMPACT_NODES` now reaches `get_impact_radius_tool`. A literal default
+  of 500 shadowed it, so the setting did nothing through MCP. (#888)
+- `traverse_graph_tool` in `dfs` mode no longer misses what lies past a node it
+  first reached at the depth limit, then reached again by a shorter path.
+- Imports through an npm alias resolve to the local package (#343, PR #880).
+  With `"sharedLib": "npm:@scope/shared@^1.0.0"` in an app's `package.json`,
+  `import x from 'sharedLib/some/module'` was stored as a bare string, so
+  `importers_of` and the impact radius found none of the apps that use the
+  shared package. Now, when one package in the repository is named
+  `@scope/shared`, the import reaches its file. Entry points are read as for a
+  workspace member (`exports`, then `source`, `module` and `main`, with
+  `dist/` tried under `src/`). A wrong edge is worse than a missing one, so
+  the import stays bare when the nearest `package.json` that names the
+  dependency gives it an ordinary version, when the local package's
+  `version` is outside the alias range, when two local packages share the
+  name, when that `package.json` cannot be read, or when the package or file
+  is one the build ignores. tsconfig `paths` still win. An alias also wins
+  over a workspace member with the same name, because npm installs the
+  aliased package under it. `update` does not re-parse importers when only a
+  `package.json` changes; run `build` after changing an alias.
+- A file added by `update` now gets a community, as it does after `build`.
+  It was in no community, so the update saw nothing affected, skipped
+  community detection and left the file's nodes without one until the next
+  full build (#1058, PR #1122 by @jay23606).
+- On Windows, `build` and `update` started with stdin on the `NUL` device
+  (`subprocess.DEVNULL`, Node's `stdio: "ignore"`) parse with threads.
+  `NUL` passes `isatty()`, so they used a process pool, and a caller that
+  stopped the run, such as a pre-commit hook timeout, left up to 8 worker
+  processes behind each time. Only a real console now keeps the process pool
+  (#1163, PR #1166 by @xOscarCodes).
+- The impact-accuracy benchmark's co-change mode no longer reports
+  `predicted_files = 0` on every commit (PR #823). `git diff` gives
+  repo-relative paths and the graph stores absolute ones under the resolved
+  root, so the seed never matched a node. The graph-derived ground truth now
+  counts real neighbour files too, and `seed_file` stays relative to the
+  repository.
+- Members of nested classes keep the full scope chain in every language that
+  did not already (#934): in Java, Kotlin, Swift, Scala and others,
+  `Alpha.Same.run` and `Beta.Same.run` are two nodes instead of one, a
+  nested class is contained by its enclosing class, and three levels keep all
+  three. Local calls stay inside their own class, and a JVM import of a nested
+  class (`import app.Outer.Inner`) targets `Outer.Inner`. On gson this leaves
+  no dangling `CONTAINS` edges (700 before) and 14 dangling `CALLS` (154
+  before). Existing graphs reparse their files with nested classes, and the
+  callers of those members, once on the next update.
+- C# declarations no longer collapse across namespaces, and calls no longer
+  bind to a type the caller cannot name. Qualified names now carry the
+  namespace and the complete containing-type path
+  (`/repo/Handlers.cs::App.Report.ExportHandler.Run`), and a dedicated
+  namespace-aware pass binds each call from its own lexical scope: `using`
+  directives are read at the byte offset of the namespace body that declares
+  them, so a reopened or file-scoped body cannot leak its imports elsewhere;
+  `global::` and namespace aliases keep their meaning; `Alias::Type` searches
+  only namespace aliases; and an unqualified call reaches a static method in
+  an enclosing type without crossing a nearer method group. File co-location
+  and short-name uniqueness are no longer treated as visibility evidence, so
+  an ambiguous or unsupported reference stays unresolved instead of pointing
+  at the wrong declaration. Overload selection, generic binding (#943),
+  inherited members and `using static` remain outside this change (#946, with
+  the nested-type identity needed by #934 and #937).
+- C# bindings are now re-evaluated on every update rather than fixed at first
+  parse. Each call keeps its raw reference, so a binding is revoked when the
+  usings or declarations behind it change, `TESTED_BY` mirrors move with their
+  call, and deleting a callee returns incoming calls to raw references so
+  recreating the declaration binds them again. A binding change marks flows
+  dirty and the next full postprocess retraces them, which keeps callers and
+  entry points outside the parsed files correct (#946).
+- C# generic declarations are keyed by arity, so a constructed receiver reaches
+  the declaration it names — `I<int>` binds to `I<T>`, `I` binds to the separate
+  `I`, and `Pair<int>` binds to neither when only `Pair<K, V>` is declared. The
+  receiver's spelling is retained on the call and the arity is read from the
+  syntax, so nested arguments and tuples count correctly. Type argument
+  substitution, constraints and overload selection remain out of scope (#946).
+- Existing C# graphs reparse once on the next incremental update to adopt the
+  new identities; a file that fails to parse is retried on its own instead of
+  holding the version gate open and repeating a full rebuild (#944). Graphs
+  that carry embeddings should re-run `code-review-graph embed` afterwards:
+  the renamed C# nodes leave their previous vectors orphaned until a refresh
+  purges them.
+- Unresolved C# member-call targets retain the receiver spelling (for example,
+  `Derived::Shared` instead of `Shared`), so `callers_of` can return fewer
+  matches for unsupported bindings, including inherited
+  members and receiver types missing from the index (#946).
+- A file inside a Python package no longer answers an absolute standard library
+  import. `import json` and `import typing` in Flask's own files were linked to
+  `flask/json/__init__.py` and `flask/typing.py`, which made a false dependency
+  and a false import cycle. Python 3 does not look in a package's own folder, so
+  those imports now stay external. A `typing.py` beside a script, or at the top
+  of a `src/` folder, can still answer them.
+- A multi-clause Elixir function is now one node that spans all its clauses. The
+  graph keeps one node per name, so the last clause used to overwrite the others:
+  a change to an earlier clause found no function at all. `parse_bytes` now merges
+  them, from the first clause's first line to the last clause's last line, and
+  keeps the first clause's parameters. Clauses of different arities share the
+  node too, as the graph has no arity in its names, so another function can sit
+  inside the span (#979).
+- `tests_for` finds Java and Ruby tests. On spring-petclinic, production symbols
+  with a test went from 5 to 61, and on sidekiq from 198 to 443. Run a full
+  `build` to pick this up.
+  - Java: a test in `src/test/java` can now reach `src/main/java`, for an import
+    and for a class in its own package, which needs no import. `this.field.x()`
+    and `var x = new Cart()` now give the type too.
+  - Ruby: `it "..." do`, `describe`, `before`, `let` and `test "..." do` are test
+    nodes in test files. A call is matched to a method only when the file says
+    what class it is made on: a constant, a constructor, `described_class`, or a
+    name assigned from one of those. A constant is looked up in the modules
+    around it first, as Ruby does, so `Cart` inside `module Shop` is `Shop::Cart`.
+  - A call in a test on something of unknown type no longer matches a method by
+    name alone, in either language. An inherited method is not linked yet, so
+    `owner.setId()` does not count for `BaseEntity.setId`.
+  - By name, `CartTests`, `CartTest`, `CartIT` and `CartSpec` now count for the
+    class `Cart`. Free text in a test's title no longer counts, so
+    `it "tests json output"` is not a test of `json`.
+  - A Ruby or Java method called only by its tests stays a flow entry point, as
+    it was when those calls did not bind.
+- `forget`, `embed` and `watch` now obey the write lock, as `build`, `update` and
+  `postprocess` already did, so none of them can rewrite a graph that a build has
+  only half written. `forget` and `embed` take it for the whole run and exit `75`
+  if another writer holds it, saying that nothing was done; both take `--wait`.
+  `embed_graph_tool` answers `status: contended`. `watch` takes it for each write
+  and lets go between them, so a running watcher never stops a build. If the lock
+  is held, a watcher keeps its changes and retries, and can still be stopped.
+- A call the graph could not bind no longer looks like one it did (#984). The
+  parser wrote a file path in front of a name it could not check, so
+  `h.hashCode()` became `One.java::Helper.hashCode` though `Helper` has no such
+  method, `self.shared()` named the subclass when `shared` was inherited, and
+  `Vec::new()` in a Cargo crate became `src/lib.rs::new`. None of these names a
+  node, yet each looked like a real link. Now no edge keeps a qualified name that
+  has no node: it goes back to the plain name, keeps the qualified one in
+  `extra.claimed_endpoint`, and returns to it if that node appears. A guess like
+  this only counts for a method of the class the call named. In Rust, a type from
+  outside the crate stays as written (`Vec::new`), which also lets
+  `WalkBuilder::new` reach the real method; `inner::bar()` on an inline module
+  lands on it; and on macOS and Windows the type `Glob` is no longer read as the
+  file `glob.rs`. On ripgrep, 729 invented call targets and 341 invented test
+  links went to 0, and real call links rose from 4,064 to 4,296 with none lost.
+  spring-petclinic went from 2 to 0 and gin had none; their real links did not
+  change.
+- Every edge claimed confidence 1.0 whatever had happened to it. For `CALLS`,
+  `REFERENCES` and `TESTED_BY`, `confidence_tier` is now `EXTRACTED` (1.0) when
+  the source names a real node, `INFERRED` (0.8, or the resolver's own score) when
+  a resolver chose it, `AMBIGUOUS` (0.4) when several nodes fit, and `UNRESOLVED`
+  (0.2) when none does. On gin, 14,353 of 16,249 such edges had no node and still
+  said 1.0. No schema change: the next build, or an update that changes a file,
+  puts an existing graph right.
+- `callers_of`, `callees_of` and `references_to` say when part of an answer is
+  only name matches, in the existing `confidence` field: "3 of 8 call sites match
+  by name only and may be wrong; resolution='direct' keeps the confirmed ones".
+- `tests_for` no longer counts a test as covering a function because both call
+  the same outside name. `String::new()` in a function and in a test linked the
+  two, and so did the invented targets above: ripgrep's `decompress.rs::add`
+  claimed 10 tests, none of which reaches it, which lowered its risk score.
+- A call to an inherited method through a subclass now finds the method
+  (#984, building on the idea in #1036 by Anthony Ala). `this.handle()` in
+  `Leaf extends Alpha`, `$this->dispatch()` in a PHP test case and
+  `pet.getName()` on a Java `Pet` that inherits `getName` named no node, so
+  `callers_of` and `tests_for` on the real method found nothing. The edge now
+  goes to the ancestor that declares the method, as `INFERRED`, and its
+  `TESTED_BY` mirror goes with it. A class is known by its file, not its short
+  name, and a parent counts only when the file, its imports, its Java package
+  or its PHP namespace says which class it is; where Python could pick another
+  ancestor, or a parent is outside the graph, the call stays unresolved. An
+  update that adds or removes the method checks the edge again, so it matches a
+  rebuild. A Java or TypeScript receiver's declared type now picks the class
+  even when that class needs no import, and a call on another object no longer
+  lands on the caller's own method when nothing says it is that class. On
+  spring-petclinic, calls bound through a subclass rose from 2 to 86, on a
+  TypeScript DDD example from 0 to 18 and on its PHP twin from 97 to 134, with no
+  new invented targets; 28 self-calls the old rule made up were dropped or
+  moved to the right class.
+- The edit hook updates the graph of the repository that holds the edited
+  file, not the one the session started in (#311). From a folder of sibling
+  repos it updated nothing, from an outer repo it updated the outer graph and
+  never the nested one, and from a main checkout it never updated a linked
+  worktree's graph. The Claude Code, Qoder and CodeBuddy hooks (and the plugin
+  `hooks/hooks.json`) now pass the event JSON to `hook-update`, which reads
+  the file path from it. That repository is updated if it already has a graph
+  or is the session's own repository, which is still built on first edit as
+  before; an edit anywhere else on disk changes no graph, and a submodule with
+  no graph of its own passes the edit to its superproject. Without a file path
+  in the event, the hook uses the event's `cwd` as before. Upgrade the package
+  before running `install` again: an older CLI has no `hook-update`, so its
+  edit hook does nothing (it still never fails the edit). `install` replaces
+  the hook earlier releases wrote, and `uninstall` removes it, including the
+  v2.3.4 to v2.3.6 form it used to leave behind.
+- `detect-changes` and `detect_changes_tool` now report what a diff that only
+  deletes code removed, and no longer miss it or blame the code around it. A
+  hunk such as `@@ -430,42 +429,0 @@` adds no lines, so it named only the
+  line before the gap: deleting a whole function reported 0 changed functions
+  and risk 0.00, with nothing about the callers it left behind, and when the
+  gap sat right after the previous function, that untouched function was
+  listed as changed. The old version of the file is now read: a function or
+  class that lost some lines is changed, and one that is gone is listed in
+  `removed_symbols` with the callers, subclasses, importers and tests that
+  still use it, and named in the summary ("Removed but still used:
+  format_filename (risk 0.65, by FileError.__init__, File.convert, ...)").
+  The code around the gap is never marked. A removed symbol that is still
+  used breaks its callers, so it is scored like a change (the flows it was
+  in are traced again) and raises the overall risk, which `fail-on-risk`
+  reads; one nothing uses adds nothing. Deleting click's `echo` with 20
+  callers now scores 0.65, where changing it scores 0.40. The PR comment
+  gets a "Removed symbols" table. Up to 100 files are read per report (`CRG_MAX_DELETION_FILES`), and
+  the summary says when a file could not be read. A deleted file is still not
+  covered. Thanks to @decrypt-mm for reporting the case in #1167.
+- TypeScript and JavaScript imports resolve against `compilerOptions.baseUrl`
+  when no `paths` pattern matches them, as `tsc` does. A tsconfig that sets
+  `baseUrl` without `paths` resolved no non-relative import at all: on a
+  NestJS monorepo whose services import `src/...`, 1,849 import edges stayed
+  bare strings, `importers_of` for one service found 14 of its 35 importers,
+  and calls on its injected services fell back to name matching.
+- A seeded `visualize` view (`--seed-symbol`, `--seed-file`, `--seed-flow`)
+  reads only the part of the graph around its seed (#1145). It used to load
+  every node, one query per file, and the whole edge table before cutting the
+  view down to `--max-nodes`, so a two-node view of a large graph cost as much
+  as the whole graph. It now reads a few columns of each node, which name
+  lookup needs, counts edges from the indexes, and loads only the edges that
+  touch the view. On this repository's graph a one-symbol view went from 380
+  SQL statements to 20 and from 120 MB to 13 MB at peak, with the same output
+  byte for byte. A path query still reads the whole graph, since a route can
+  run anywhere, and so does a view that reaches most of a large graph.
+- Translation files no longer flood the graph. A translation file repeats the
+  same keys once per language, and each key became a `YamlPath` node: on sidekiq,
+  `web/locales/*.yml` gave 3,147 of the 3,336 `YamlPath` nodes. A YAML file in a
+  `locale`, `locales`, `i18n`, `l10n` or `translations` folder whose name or
+  sub-folder is a language code, such as `config/locales/devise.en.yml` or
+  `locales/pt-BR/app.yml`, now gets a file node only. Sidekiq's graph falls from
+  5,085 nodes to 1,935 and its database from 45 MB to 31 MB. A name alone is not
+  enough, so `config/en.yml` and `.github/workflows/it.yml` keep their paths, and
+  so does `locales/deploy.yml`. Run `build` to clear these nodes from a graph you
+  already have; `update` only re-reads files that changed.
+- `semantic_search_nodes_tool` and `cross_repo_search_tool` apply `kind` before
+  they cut the hits, not after. Rows of another kind could fill the fetch limit, so
+  asking for functions could return few or none when many existed: `dead` with
+  `kind="Function"` found 1 of them on sidekiq and now finds 9. If the exact
+  reading of a query matches only other kinds, the wider reading is now tried.
+- `tests_for` gives the same answer every time on the same graph. On a large
+  class it follows at most 50 callees (`CRG_MAX_TRANSITIVE_FRONTIER`), and it
+  picked them in an order that changed with each new process, so an MCP
+  restart or a new CLI call gave a different list. On koel, 20 runs on one
+  graph gave `SongService` anything from 43 to 90 tests, and every run gave a
+  different list. The 50 are now the first by name, with named callees before
+  bare ones, which are never followed. The `detect_changes` risk score counts
+  the same tests, so it is steady too. Two builds of the same code already
+  gave the same graph; only the query moved.
+- Imports of sibling packages in npm, yarn and pnpm workspaces resolve to the
+  package's source files (#1030). A specifier such as `@acme/shared` or
+  `@acme/sdk/browser` names a package-manager link, not a
+  `compilerOptions.paths` alias, so it was stored bare and `importers_of`,
+  the impact radius and `references_to` stopped at every package boundary.
+  Calls through a package's barrel file now reach the defining file as well.
+  The new `WorkspaceResolver` finds the nearest `pnpm-workspace.yaml` or
+  `package.json` with `workspaces` inside the repository, maps each member's
+  `name` to its directory, and reads `exports` (subpaths, conditions,
+  fallback arrays and `*` patterns, with Node's key priority; a `null` entry
+  or an unlisted subpath stays unresolved), then `source`, `module`, `main`, `types` and
+  `typings`. A target under `dist/`, `build/`, `out/` or `lib/` is tried
+  under `src/` with source extensions first, because compiled output is
+  normally absent from a checkout. tsconfig `paths` still win when both
+  apply. Because a wrong edge is worse than a missing one, an unscoped name
+  resolves only when the importing package declares it as a dependency, Node
+  builtin names such as `events` never resolve to a workspace member, a name
+  two members share resolves to neither, probes are case-exact on every
+  platform, and a target the build would not index keeps the bare specifier.
+- The Claude Code plugin's hooks load again. `hooks/hooks.json` held a bare
+  event map, which current Claude Code rejects with "hooks.json must have
+  `hooks` (the hook matchers) or `modules` (hooks modules), or both", so the
+  SessionStart and PostToolUse hooks never ran. The events now sit under a
+  top-level `"hooks"` key, the shape the plugins reference documents. The hooks
+  carry the same guards as the ones `install` writes, so a missing
+  `code-review-graph`, a folder outside Git or a failed command shows no hook
+  error, and the update hook matches `Edit|Write` only, so a Bash command can no
+  longer start a full build in a repository with no graph.
+- The OpenCode installer now detects the installed OpenCode major version and
+  writes the matching plugin API: returned hooks for OpenCode 1.x and the
+  `id` + `setup` definition for OpenCode 2.x. Both templates use bounded
+  `node:child_process` argv execution. The 1.x template runs from the OpenCode
+  worktree/current directory instead of passing that directory as `--repo`, so
+  starting OpenCode in a repository subdirectory still resolves the graph root.
+  The 2.x template keeps its plugin package import type-only, so OpenCode
+  2.0.0–2.0.24 can load it without a runtime `@opencode/plugin` dependency.
+  This fixes the V2 loader error `Plugin must export a default definition with
+  an id and an effect or setup function` without dropping 1.x support (#1038,
+  #947). Each plugin instance runs one graph update at a time, and edits made
+  during a run share one follow-up run, because an overlapping update reads the
+  first run's in-progress marker as a crashed build and does a full rebuild.
+- Codex hooks act on the repository named by the event's `cwd` instead of the
+  directory Codex was launched from, so they cannot update the wrong graph. The
+  generated hooks now run the new `hook-update` and `hook-status` commands, which
+  ignore a missing, relative or non-repository `cwd`. Upgrade the package before
+  running `install --platform codex` again; `install` and `uninstall` both
+  recognise the hooks earlier releases wrote.
+- `**/vendor/**` applies only when a root manifest shows `vendor/` holds
+  dependencies (`composer.json`, `go.mod`, `go.work`, `Gemfile`, `Rakefile`,
+  `Cargo.toml` or `*.gemspec`), and a nested one excludes its sibling
+  `vendor/`. A source package named `vendor` in any other repository stays in
+  the graph; add `vendor/` to `.code-review-graphignore` to exclude it (#1056).
+- `from module import name as alias` followed by `alias(...)` is recorded as
+  a call to `module.py::name`. It used to qualify the alias,
+  `module.py::alias`, a target that matches no node.
+- A call through a Python module receiver whose module only re-exports the
+  name (`pkg.helper()` where `pkg/__init__.py` does
+  `from .impl import helper`) resolves to the defining file. The resolver
+  required the name at the top level of the receiver's own module, so the
+  call stayed unresolved.
+- `_strip_plsql_noise` tracked string-literal state per line and stripped
+  `/* */` comments over the raw text in a separate first pass, so a
+  string literal spanning multiple lines (or containing an unterminated
+  `/*`) could desynchronize the rest of the file: an `END name;`-shaped
+  substring inside a multi-line string terminated a block early, an
+  Oracle `q'[...]'`/`Q'<...>'` quoted string (which allows unescaped `'`
+  inside it) confused the plain `'...'` state machine the same way, and
+  an unterminated `/*` inside one string literal could pair up with an
+  unrelated `*/` inside a later string and blank out everything between
+  them — including a whole `CREATE PROCEDURE` statement that happened to
+  fall in that span, which also regressed plain (non-Oracle) SQL files.
+  It now tracks string and comment state in one pass over the whole file.
+  `_plsql_block_end`'s terminator search also ran unbounded to
+  end-of-file, so a package body member using a bare `END;` could match
+  an unrelated, later package body's same-named member's `END name;`
+  instead of its own, and the unbounded search was quadratic on a file
+  with many members (~4s for 4,000). It now takes a `limit`, bounding a
+  member's search to its own enclosing package body (PR #785 review).
+- An incremental update now keeps flows and communities in step with the
+  graph. A new entry point gets its flow, a re-parsed file's flows follow its
+  nodes to their new IDs, and a deleted file leaves no empty community behind.
+  Before, relative changed paths never matched the stored absolute ones, so
+  flows and communities were silently skipped (#569, #1058).
+- Overlapping graph writes no longer stack their work (#1073). `build`,
+  `update` and `postprocess` take a per-repository `flock` on
+  `<data dir>/write.lock` before parsing or rewriting derived data, so a second
+  invocation reports `status: contended` (CLI: `Skipped: another
+  code-review-graph ... is already running for this repository (PID n)`) and
+  exits `75` (`EX_TEMPFAIL`) instead of repeating the work. Commit hooks,
+  editor-save hooks and agent tool hooks fire in bursts, and until now the only
+  cross-process protection was SQLite's busy timeout, which is not reached
+  until the first write — every duplicate run paid for a complete parse first,
+  and a `postprocess` could rewrite flows/communities/FTS for a graph another
+  process was still storing. Ten concurrent `update` runs of one repository
+  used to mean ten process pools on the same files. `--wait`
+  (`wait_for_lock`) blocks until the in-flight write finishes, for callers that
+  want the work done rather than skipped; two repositories never block each
+  other; and the fixed lock path lets external tooling take the same lock. The
+  lock covers schema initialization, legacy migration and CLI recovery too.
+  Forked parse workers close inherited lock handles, so killing their parent
+  releases the lock even while workers remain alive. A filesystem without
+  `flock` support logs a warning and runs unlocked rather than reporting a
+  competing writer. Invoke protected CRG commands directly; external `flock`
+  wrappers are for other writers.
+- An explicit embedding refresh (`--embedding-provider` with
+  `--embedding-model`, or the `embedding_provider` and `embedding_model`
+  arguments of `build_or_update_graph_tool` and `run_postprocess_tool`) on a
+  graph with no embeddings yet now reports that it embedded nothing. `build`,
+  `update` and `postprocess` return `embeddings_refresh_skipped: true` and a
+  warning to run `code-review-graph embed` once, and so does an `update`
+  that finds no changes. `watch` logs the same warning after each update and
+  keeps running; a refresh that fails against an existing index still stops
+  it, as before. The refresh used to return `ok` with no embedding field,
+  the same result as a build that never asked for one. It still loads no
+  model and makes no network call in that case (#1070).
+- A rename rewrites the import statements that name the symbol (#1107).
+  The preview looked for import edges that target the symbol, but Python
+  import edges target the imported module's file, so `from pkg.util import
+  helper` was never edited and the applied code raised `ImportError`. The
+  preview now reads the defining module and every module that imports it,
+  and follows Python's scope rules: `from module import name` in every
+  spelling (several names on a line, parenthesized over several lines with
+  comments, `as` aliases, relative imports), packages that re-export the
+  name and their `__all__`, `import module` then `module.name`, and
+  imports inside functions. Calls that no import statement names are still
+  found through the graph's call edges and resolved the same way:
+  `pkg.util.name()` after `import pkg`, `sub.util.name()` after
+  `from pkg import sub`, and a module bound by `importlib.import_module`.
+  JavaScript and TypeScript get the same for `import { name }`,
+  `import { name as x }`, local export lists, `export { name } from` and
+  `export * from` barrels (also a public barrel nothing in the repository
+  imports from), and `ns.name` through `import * as ns`, `import ns =
+  require()`, `const ns = require()`, `await import()` and
+  `import().then()`. A CommonJS `module.exports = { name }` keeps its key,
+  so its importers keep the old name. An alias keeps its own name; a
+  parameter, local, comprehension variable or class attribute that reuses
+  the name is left alone, and so are comments, strings and longer names
+  that contain it. A call inside a shell `"$(...)"` is code and is renamed.
+- Rename edits are exact. Each one carries the `column` where the old name
+  starts and the `site` it is (`definition`, `call`, `reference`,
+  `import`, `export`, `attribute`, `__all__`), and applying replaces the
+  name only there. Before, applying replaced the first substring match on
+  the line (`helper_count` became `double_count`) and, when the line had
+  none, the first match anywhere in the file. A method call chained over
+  several lines, or made inside an f-string, is renamed where its name is
+  rather than in a comment or the string's text. An edit that no longer
+  matches is skipped and counted in `edits_skipped`. CRLF line endings, a
+  byte-order mark and non-ASCII text survive, and a file that is not UTF-8
+  is no longer rewritten with replacement characters.
+- `refactor_tool(mode="rename")` resolves `old_name` exactly. It accepts a
+  name, `Class.method` or a qualified name such as `pkg/util.py::helper`.
+  When a bare name belongs to several symbols the first by file and line
+  is renamed, and the preview's new `qualified_name` says which; pass a
+  qualified name to pick another. A name that matches no symbol is
+  `not_found` instead of falling back to a symbol whose name merely
+  contains it.
+- tsconfig and jsconfig path aliases inherited through a relative `extends`
+  resolve against the config that declares `baseUrl` (or `paths`, when no
+  config in the chain sets `baseUrl`), as tsc does, instead of the nearest
+  config's directory. In an Nx or Turborepo layout every app extending a root
+  `tsconfig.base.json` lost its alias imports, so `importers_of` and the
+  impact radius of a shared library missed those apps (#1110). Also as in
+  tsc, a base config reached through a symlink (to the file or to a
+  directory above it) anchors where the link sits, and a `..` in its
+  `baseUrl` or `paths` climbs from there; `"baseUrl": null` in an extending
+  config unsets the inherited `baseUrl`.
+- Python `@property` reads produce edges, so `callers_of` and `find_dead_code` see them (#1065, #1060).
+- Python and Ruby classes that share a leaf name in one file no longer overwrite each other's methods (#1087, #999).
+- Terraform provider aliases keep distinct nodes, and references reach the right one (#1083, #985).
+- PowerShell functions, classes, methods and calls are extracted again (#1079, #1067).
+- Elixir `def` with a `when` guard is indexed and short-form bodies are walked (#980, part of #979).
+- JavaScript and TypeScript generator functions are `Function` nodes that own their calls (#1131).
+- Components wrapped in `forwardRef`, `memo` and similar calls are `Function` nodes (#972, #971).
+- TypeScript abstract classes are indexed, with nodes for their abstract methods (#1033, #1031).
+- Compact Ruby `class Foo::Bar` declarations emit `Class` nodes with stable identity, and all nested Ruby methods now carry their full scope, such as `Auth.User.to_s`. This moves the schema to version 14, and the next `update` re-keys Ruby files by itself (#933, #932).
+- `install` no longer appends a shell block to a `pre-commit` hook written in another language, which made every commit fail.
+- `uninstall` removes the empty Codex skills folder it created.
+- Calls inside Rust `if false` blocks are left out of the graph (#1132).
+- `@Override` methods and JUnit lifecycle methods count as entry points in dead-code analysis (#1035, #1034).
+- Spring calls on a concrete injected type stay on that type instead of moving to its only subclass (#1075, #1074).
+- `tests_for` and the test-gap report name tests reached through spec helpers (#1128, #1109).
+- `get_impact_radius` and `get_review_context` report unknown risk when a requested path is not in the graph (#1084, #983).
+- The real-absence claim is withdrawn while untracked source exists (#987).
+- Review guidance applies the lifecycle test-gap exemption (#871, #865).
+- A registered data directory that has gone missing no longer strands a local graph (#1080, #1057).
+- Untracked files reach `build` and `update` (#1094, #998).
+- A no-op `update` repairs stale FTS left by `--skip-postprocess` (#1105, #1104).
+- MCP auto-watch runs post-processing after updates (#1108, #1103) and stops and joins its watcher before closing the store (#1127, #1121).
+- Partial graphs recover once and then stay incremental (#881, #803).
+- Renames through re-exports match a full build, and importers keep their flows and communities (#1062).
+- Watch mode does not report a refused directory as adopted (#910, #907) and does not watch ignored trees created after startup (#973, #908).
+- Windows daemon logs accept Unicode and tolerate vanished PIDs (#1129, #866), and a Job Object ends watchers when the daemon dies (#958, part of #925).
+- `tests_for` names PHP tests that reach a class through the Laravel container,
+  and says they are guesses (part of #850). Run a full `build` to pick this up.
+  - A PHP call on an expression, such as `$this->service->run()` or
+    `app(Service::class)->run()`, was bound to a method of the same name in the
+    calling file. A test named after the method it tests was recorded as calling
+    itself: 113 such edges from tests on koel/koel. It now stays unresolved, as
+    the same call in Python does.
+  - When more than one class the test imports defines the called method, the
+    test is listed with `inferred_by: "ambiguous_call"`, unless the call is made
+    on one of those classes that the test builds, as in
+    `(new UpdateBooks)->handle()`. Building one class does not settle the
+    test's other calls. On koel, classes with a test file that names them but
+    no `tests_for` answer went from 17 to 12.
+  - The summary says how many rows are guesses, and `detail_level="minimal"`
+    keeps `inferred_by` on `tests_for` rows.
+  - A guess is never coverage: test gaps and risk scores do not count it. The
+    `detect_changes` summary says PHP gaps are a guess, since container and
+    HTTP calls are not traced (#851 is the full fix).
+- Migration `up` and `down` methods are not test gaps when the file is in a
+  `migrations` or `migrate` folder inside the repository (#850).
+
+### Upgrade notes
+
+- **Schema version: 13 → 15.** Two migrations run by themselves the first time
+  any command opens the graph. Both are quick, as neither rewrites a table:
+  - v14 clears the stored hash of every Ruby file, so the next `update` parses
+    those files again and gives Ruby classes and methods their full names, such
+    as `Auth.User.to_s`. Until that update, Ruby rows keep their old names.
+  - v15 drops `community_summaries`, `flow_snapshots` and `risk_index`, which
+    nothing read, and three indexes that other indexes cover. The file keeps its
+    size and reuses the space; to shrink it, delete it and run `build`, or run
+    `VACUUM`.
+
+  Rolling back needs a rebuild. Migrations only go forward. 2.3.9 refuses a v15
+  graph with "was written by a newer code-review-graph (schema v15; this build
+  understands v13)", so to go back, delete `.code-review-graph/graph.db` and
+  run `code-review-graph build` with the older release.
+- **The VS Code extension has to be updated as well.** 0.3.0 accepts v13 and
+  answers a v15 database with "Database was created with a newer version
+  (schema v15). Update the extension." This repository now carries 0.4.0,
+  which accepts v15. The extension is published apart from the Python package,
+  so until a 0.4.0 `.vsix` is built and installed, the Code Graph panel shows
+  that error once the CLI has moved the graph to v15.
+- **Run `code-review-graph build` once.** `update` only parses files that
+  changed, so most fixes in this release reach a file only when it is parsed
+  again: the new file types (HTML, XSLT, Liquid, JSON, plain YAML, `.cjs` and
+  `.kts`), translation files losing their key nodes, `vendor/` folders that
+  hold source, workspace and npm alias imports, tsconfig `baseUrl` and
+  `extends`, `extra.import_context` on import edges, the call and test fixes
+  (#984, inherited methods, `tests_for` for Java, Ruby and PHP) and the
+  confidence tiers. Ruby files (v14 above), files with nested classes and C#
+  files are the exception: the next `update` parses them again by itself. If
+  the graph has embeddings, run `code-review-graph embed` after that, because
+  renamed C# nodes leave their old vectors behind.
+- **Upgrade the package, then run `code-review-graph install` again.** The
+  hooks and instruction blocks an earlier release wrote do not update
+  themselves. Install now also writes `post-checkout`, `post-merge` and
+  `post-rewrite` git hooks; the edit hook for Claude Code, Qoder and CodeBuddy,
+  and the Codex hooks, call the new `hook-update` and `hook-status` commands;
+  and the instruction block has new search guidance. Upgrade first: an older
+  CLI has no `hook-update`, so the new edit hook would do nothing. Install and
+  uninstall still recognise everything 2.3.9 and earlier releases wrote.
+- **New settings are off by default.** Nothing changes unless you turn them on:
+  `--enrich` or `CRG_ENABLE_ENRICHMENT=1` (needs the `enrichment` extra),
+  `install --steering`, `install --gitignore`, `--follow-symlinks` or
+  `CRG_FOLLOW_SYMLINKS=1`, `CRG_CONTEXT_HISTORY=1`, `CRG_VECTOR_CACHE=1`,
+  `serve --http --multi-repo`, `serve --multi-worktree` and the Action's
+  `details` input.
+- **Output and dependency changes.** Build results no longer carry
+  `summaries_computed` or `summaries_s`. On `find_large_functions_tool`,
+  `semantic_search_nodes_tool` and `traverse_graph_tool`, `result_count` is now
+  the count before the cut. The lowest supported versions of `mcp`, `anyio`,
+  `tree-sitter`, `tree-sitter-language-pack` and `pyyaml` are higher, and
+  fastmcp 4 is allowed (see *Changed*).
+- **GitHub Action cache.** The cache key segment moves from `schema13` to
+  `schema15`, so the first run after upgrading restores no graph cache and
+  builds from scratch. Self-hosted runners can delete the old
+  `code-review-graph-schema13-*` entries.
+
+## [2.3.9] - 2026-09-18
+
+### Added
+
+- `visualize` can draw a neighbourhood instead of the whole repository. The
+  D3 page falls back to one bubble per community past 3000 nodes or 9000
+  edges, which a shallow clone of django (45,111 nodes, 397,762 edges)
+  passes by 15x and 44x, so every serious codebase got the bubble view. Nine
+  new flags seed a view and bound it: `--seed-symbol`, `--seed-file`,
+  `--seed-changed` with `--seed-changed-base`, `--seed-flow`, `--path-from`
+  and `--path-to` for a shortest path, and `--depth`, `--render-depth` and
+  `--max-nodes` for how much is carried and drawn. Nodes outside the
+  neighbourhood are absent from the payload rather than dimmed. A hop is a
+  semantic edge (CALLS, IMPORTS_FROM, INHERITS, IMPLEMENTS, TESTED_BY,
+  DEPENDS_ON); CONTAINS is structural and deliberately not a hop. Search,
+  filters, community colouring, the flow selector and the keyboard
+  shortcuts all keep working, and the default output is still one
+  self-contained HTML file. The whole-repository view is unchanged when no
+  seed flag is passed.
+- `cross_repo_search_tool` accepts `repos`, a list of registry aliases or
+  folder names, to search only part of the registry. Names that match no
+  entry come back in `unknown` and names that match several entries in
+  `ambiguous`; both lists are bounded like every other list (#915).
+- `query_graph_tool` resolves dotted targets such as
+  `Details.QueryHandler.Handle` through an indexed `nodes.symbol` column,
+  added by migration v10. See *Upgrade notes* for the full schema move
+  (#942, #934).
+- `update` and `build_or_update_graph_tool` report files that failed to
+  parse: the status is `partial`, the summary names the files and the CLI
+  prints a warning on stderr. A failed file keeps its previous graph rows
+  (#952).
+- `CRG_HOOK_WORKTREES=1` keeps the generated pre-commit hook active inside
+  a linked Git worktree (#953).
+- `CRG_DISCOVERY_TIMEOUT` bounds each Git command that discovers what
+  changed when a review tool or command was not handed an explicit file
+  list. It defaults to 5 seconds, capped at `CRG_GIT_TIMEOUT` so an
+  unset-but-lowered general budget still wins; setting it explicitly is an
+  instruction and is used as given, above `CRG_GIT_TIMEOUT` included. When
+  it is unset and `CRG_GIT_TIMEOUT` was set explicitly, discovery inherits
+  that value, so the documented remedy for slow Git keeps working. Read on
+  every call rather than frozen at import. `CRG_GIT_TIMEOUT` keeps its
+  30-second default and still governs build, update and watch (#262).
+- `staging` is promoted to `testing` automatically, once a day, when it has
+  commits `testing` lacks, every required status check is green on its tip,
+  and the promotion gate has not failed on the `testing` tip.
+  `.github/workflows/auto-promote.yml` opens the promotion pull request and
+  merges it with a merge commit, so contributor authorship survives; the
+  decision lives in `scripts/auto_promote.py` and reads the required
+  contexts from the `testing` ruleset at run time. It merges only a pull
+  request it opened itself — same repository, `staging` → `testing`,
+  labelled `auto-promotion`, and pinned with `--match-head-commit` to the
+  commit whose checks were read — all re-verified immediately before the
+  merge, so a fork branch named `staging`, a base branch changed after the
+  fact, or a promotion pull request opened by hand cannot be merged by it. A
+  hand-started run defaults to a dry run. Requires *Allow GitHub Actions to
+  create and approve pull requests* under Settings → Actions → General.
+  Promotion to `main` is never automatic and the workflow cannot target it.
+
+### Changed
+
+- Keyword search is rebuilt, and it needs a rebuilt graph. `_fts_search`
+  wrapped the whole query in one pair of double quotes, so every multi-word
+  search was an exact-adjacency phrase match: on a build of this repository
+  `password hashing` returned 0 rows. Queries are now built from tokens —
+  each quoted, given a prefix term when it carries at least three
+  alphanumeric characters, ANDed first and ORed only if the AND finds
+  nothing, so recall widens without costing precision. A phrase typed in
+  quotes stays a phrase and suppresses the OR widening, and the expression a
+  prose question builds is bounded. Two new indexed columns feed it:
+  `nodes.docstring` (2,451 of this repository's 6,517 nodes carried a
+  docstring the FTS index could not see, because an external-content FTS5
+  table can only index real columns of its content table) and
+  `nodes.name_tokens`, the camelCase splits `unicode61` cannot produce,
+  which raises inner-camel segment recall@20 from 24.7% to 54.7% for a 2.7%
+  larger index. An exact-identifier boost and a symbol-name coverage boost
+  keep BM25 precise against the widened candidate set; the shipped
+  `search_quality` benchmark goes from MRR 0.667 to 1.000.
+- A test gap that tests reach only through a caller is reported as its own
+  class rather than as an unqualified gap. `TESTED_BY` is a direct edge, so
+  a private helper the suite exercises only through the public function
+  above it carried none and was reported untested — 5 of the 74 gaps on one
+  measured delta, including `main.py::_offload`. Each changed symbol is now
+  classified in one batched pass: direct `TESTED_BY`, else a two-hop upward
+  walk over incoming `CALLS` looking for a tested caller, which is the new
+  `GraphStore.get_caller_test_routes`. Reachability is reported as a note,
+  never as coverage: the gap set is unchanged, gap order stays class-blind
+  so truncation cannot hide a real gap first, and risk scoring is not
+  discounted — 32 of the 504 symbols the walk reaches are never executed by
+  the suite, and no depth, fan-out or same-file rule tried moved that below
+  ~5%. Reached gaps carry `covered_via`, `covered_depth` and `covered_by`,
+  and the rendered pull-request comment gives them their own heading with an
+  "indirect" Tested column. Two new environment variables bound the walk:
+  `CRG_CALLER_TEST_ROUTE_DEPTH` (default 2 — over the measured delta depths
+  3, 4 and 5 rescue exactly zero) and `CRG_CALLER_TEST_ROUTE_MAX_CALLERS`
+  (default 500).
+- Hints, `next_tool_suggestions` and the prompt templates name the
+  registered tools (`detect_changes_tool`, not `detect_changes`), so agents
+  are no longer told to call tools that do not exist. The generated
+  instruction blocks already named them and are unchanged from 2.3.8, so
+  reinstalling is not needed for this fix (#821).
+- `detect_changes`, `get_review_context`, `get_affected_flows`,
+  `get_impact_radius`, `get_minimal_context` and `update --brief` resolve a
+  branch ref to its merge base with `HEAD`, matching GitHub's "Files
+  changed" view on divergent branches. Commit IDs and revision expressions
+  are used as given, and a shallow clone that cannot resolve the merge base
+  falls back to the ref (#847).
+- Per-file node and edge writes, bare-endpoint resolution and signature
+  computation run as batched statements in a single transaction each,
+  instead of one autocommitted row at a time, which cuts build time on
+  large graphs (#858, #721).
+- The generated pre-commit hook skips automatic checks in a linked
+  worktree, so a commit there cannot silently create a second graph for
+  another branch. Detection uses the git directory's `commondir` file and
+  needs only `git rev-parse --absolute-git-dir` (Git 2.13). Reinstall
+  upgrades the exact hook block written by earlier releases (#953).
+- Every MCP tool that can reach Git discovery, a graph traversal, FTS, an
+  embedding provider or the filesystem now runs its work on a worker thread
+  through one shared helper. A tool that exceeds `CRG_TOOL_TIMEOUT` answers
+  with `status: error` naming itself and the budget, instead of leaving the
+  client to time the request out itself as MCP error -32001. Only
+  `get_docs_section_tool` and `list_repos_tool` still run inline; they read
+  one small file each (#262, #46, #136).
+
+  `CRG_TOOL_TIMEOUT` keeps its meaning: it bounds read-only tools, and it
+  does **not** bound `build_or_update_graph_tool`, `run_postprocess_tool`,
+  `embed_graph_tool`, `generate_wiki_tool` or `apply_refactor_tool`. Those
+  write — to `graph.db`, to the wiki tree, to your source files — and a
+  timeout cancels the wait, not the worker, so bounding them would report
+  failure to the client while the write went on regardless.
+- Change discovery is bounded honestly. Each Git command in the chain that
+  works out what changed gets `CRG_DISCOVERY_TIMEOUT` (5 seconds) rather
+  than the 30-second `CRG_GIT_TIMEOUT`, and runs with `require_vcs`, so
+  exhausting that budget raises a `ChangeDiscoveryError` and the tool
+  answers `status: error`. A shorter budget on its own would not have been
+  enough: discovery that ran out of time *silently* is what produced
+  #913's false all-clear, and the same silence at the base resolution
+  degrades a three-dot diff into a two-dot one. Raising `CRG_GIT_TIMEOUT`
+  still raises discovery with it, so the documented remedy for slow Git
+  keeps working (#262).
+- `get_minimal_context_tool` runs its change discovery on that same budget.
+  It previously spent up to ~130 seconds on five Git subprocesses of its
+  own — the tool agents are told to call first, and the one most likely to
+  hit a client's request ceiling (#262).
+
+### Fixed
+
+- Ruby compact namespace declarations (`class Foo::Bar`) are indexed. The
+  name sits in a `scope_resolution` node rather than a bare `constant`, so
+  the class node was dropped entirely and its methods were left orphaned at
+  file scope -- the dominant declaration style in Rails codebases
+  (`class Admin::UsersController < ApplicationController`) produced no class
+  at all.
+- Ruby classes carry their namespace in `parent_name`, and their methods
+  qualify against the class's own key. `class A::Same` and `class B::Same`
+  in one file both resolved to `file.rb::Same`, and because `qualified_name`
+  is UNIQUE one of them was dropped outright while the survivor absorbed
+  both sets of methods. A method's `CONTAINS` source now names the class
+  node that exists rather than a bare-leaf container that was never
+  emitted, so `children_of` reaches the methods of a class declared inside a
+  compact module. The compact and nested spellings agree at every depth:
+  `module A; class B::C` and `module A; module B; class C` both key to
+  `file.rb::A.B.C`. This is schema version 14; existing databases mark their
+  Ruby files for re-parsing on open and pick up the new identities on the
+  next update, and the VS Code extension accepts the new version.
+- Ruby declarations whose scope is not a constant (`class klass::Inner`,
+  `class self::Foo`) no longer emit a file-scope class node. Their scope is
+  resolved at run time, so there is no static namespace to record.
+
+- PL/SQL identifiers with non-ASCII letters (e.g. `café`) were silently
+  truncated at the first accented character (`_PLSQL_IDENT` was
+  `[A-Za-z_][A-Za-z0-9_$#]*`, unlike the `\w`-based identifier matching used
+  for non-Oracle SQL elsewhere in this file, which is Unicode-aware by
+  default). The leading character class is now `[^\W\d]` instead of
+  `[A-Za-z_]`, so PL/SQL identifiers are Unicode-aware like the rest of the
+  file while still correctly handling Oracle's `$`/`#` mid-identifier
+  characters.
+- Go and Ruby imports resolve into the repository instead of staying bare
+  strings. Go reads the module path from the nearest `go.mod` (nested
+  modules win over their ancestors, and local `replace` targets are
+  honoured) and maps an in-repo import to the package DIRECTORY it names;
+  the standard library, undownloaded dependencies and anything the ignore
+  patterns exclude stay unresolved. Ruby resolves `require_relative`
+  against the requiring file and `require`, `load`, `autoload` and
+  `require_all` against the repository's load roots (gemspec
+  `require_paths`, `lib`, `test`, `spec`, the Rails `app` roots, and
+  `$LOAD_PATH.unshift` in a root script); gems stay unresolved.
+  `importers_of` for cli/cli's `pkg/iostreams/color.go` goes from 0 to 424,
+  and for jekyll's `test/helper.rb` from 0 to 51.
+- A Go import names a package and a Ruby `require_all` names a directory
+  tree, so both emit ONE edge naming that directory, tagged
+  `extra.import_scope`, and the read path expands a directory to its member
+  files. `importers_of` matches edges targeting a file's own package,
+  `imports_of` reports `import_target_kind`, and the impact traversal
+  follows a package target at every hop without spending one. One edge per
+  package keeps the edge count proportional to import statements rather
+  than to imports times package size: kubernetes/kubernetes records 93,650
+  import edges where an edge per member file would be 588,972 (73,507 of
+  them from one imported package), and builds in about 146s rather than
+  524.6s. It also keeps an incremental update in agreement with a rebuild,
+  which a per-member fan-out cannot do, because an edge's targets would then
+  depend on which files were in the package when the importing file happened
+  to be parsed.
+- Binding imports that previously stayed bare costs build time and disk, on
+  every repository measured, and never saves either. Measured with the
+  import change off and on against the same parent commit — which already
+  carried the batched writes below, so these figures isolate the import
+  change and are not a comparison against 2.3.8: a kubernetes/kubernetes
+  build goes from 115.1s and 122.8s to 148.7s and 146.5s (about 24% slower)
+  and its database from 4.41 GB to 5.36 GB (21.5% larger), run isolated and
+  alternating on one idle machine; cli/cli goes from a 7.6s build and a
+  281.1 MB database to 9.3s and 325.9 MB. What that buys is that a bound
+  import also lets the call resolver attribute cross-file calls: on cli/cli
+  the CALLS edges bound to an indexed node go from 5503 to 22564 of 67503,
+  with the edge count unchanged.
+- The impact traversal's directory branch is pinned to an index seek on
+  `(target_qualified, kind)`. Left to itself SQLite drove it from the
+  covering index on `kind` alone and rescanned every `IMPORTS_FROM` row once
+  per frontier directory, which was 18 seconds of a 19-second kubernetes
+  traversal; pinned it is 1.8s, against 6.5s for the same answer under the
+  per-file fan-out. `tests/test_import_scope.py` asserts the plan.
+- No import edge names a path the build does not index. 73,512 kubernetes
+  import edges named a path the build never indexed, 73,507 of them files
+  under `vendor/`, which `**/vendor/**` excludes, so every one of them was a
+  confident-looking path that matched no node. Five remain. Such an import
+  keeps its bare module string, which is visibly external.
+- `get_impact_radius` bounds every list in its response by a fixed ceiling
+  -- the same 100 nodes, 150 edges and 200 files `get_review_context`
+  applies to the same radius -- and reports `edges_omitted`,
+  `changed_nodes_omitted` and `impacted_files_omitted` alongside the
+  existing `nodes_omitted` and `total_impacted`. `edges` and `changed_nodes`
+  had no ceiling at all and `max_results` was not exposed on the MCP tool,
+  so the response grew with the repository: 138k tokens on one changed file
+  of cli/cli and 189,163 on one of kubernetes, against a documented 12k
+  budget. That kubernetes response is now 23,669 tokens. Edges that touch the
+  changed code are kept first, and `max_results` is now an argument of
+  `get_impact_radius_tool`.
+- Every specifier in a Go `import ( ... )` block carries its own line.
+  8636 of cli/cli's 8687 import edges (99.4%) were stamped with the line of
+  the `import (` token.
+- Ruby import extraction dispatches on the call's method name instead of
+  testing whether the node text contains "require". 31 of jekyll's 227
+  import edges (14%) were not on a require line at all, with targets such
+  as `Missing --ssl_cert or --ssl_key. Both are required.`; those call
+  subtrees were also being dropped whole, so their calls are now
+  extracted. `autoload`, which is how jekyll declares its entire internal
+  module graph, produced no edge at all.
+- Freshness metadata follows what was stored. A no-op `update` that
+  confirms `HEAD` advances the Git anchor, so queries after a commit no
+  longer carry a stale-graph caveat, and a file that fails to parse no
+  longer holds the anchor back for the files that did parse (#952).
+- `update` compares stored hashes with the files on disk, so a change that
+  was indexed and then reverted is re-parsed even when the Git diff is
+  empty. Each indexed file is still read only once per update, and binary
+  checks read only the first 8 KB (#860).
+- Failed C++ identity migrations are retried file by file instead of
+  rebuilding files that migrated correctly, and a file that failed and was
+  then ignored is dropped from the pending set instead of making every
+  later update report "Identity migration pending for ignored file" and
+  stopping `watch` from starting (#944).
+- The Spring and Temporal resolvers take interface implementors only from
+  Java, Kotlin and Scala classes, so Go struct embeddings are no longer
+  mistaken for Java implementations while Kotlin and Scala implementors
+  keep resolving (#834).
+- Go embedded structs and interface composition produce `INHERITS` edges
+  again, including grouped `type (...)` declarations and generic embedded
+  types (#834).
+- tsconfig path aliases probe `.mts` and `.cts` targets, `.mts` and `.cts`
+  files are indexed as TypeScript in full builds, and `.mjs` and `.cjs`
+  import specifiers resolve to `.mts` and `.cts` sources before falling
+  back to `.ts` and `.tsx` (#874).
+- `forget` and `dead-code` resolve the database the way the other
+  read-only commands do, without creating graph state when none exists,
+  and still migrate a legacy top-level `.code-review-graph.db` instead of
+  reporting "No graph found" (#874).
+- C, C++ and Bash grammar probes put the parent interpreter's
+  `tree_sitter_language_pack` location on the child's path, so grammars
+  installed in a venv or with `pip install --user` are no longer reported
+  missing, and probe failures carry an install hint (#810, #807).
+- Go methods whose receiver type carries a comment or parentheses are
+  attached to their type (#872).
+- Kotlin import names are read from the AST, including `as` aliases, and
+  wildcard imports no longer produce an entry (#873).
+- PHP `include`, `include_once`, `require` and `require_once` with a
+  literal path create import edges. Dynamic paths are not evaluated, and
+  the empty-result caveat says so (#875, #819).
+- Python `import a.b as c` is extracted as an import of `a.b` (#955).
+- `get_all_files` no longer fails on malformed `extra` JSON left behind by
+  a killed writer (#870, #864).
+- Dotted Python module imports (`src` layouts, `odoo.addons.*`) count as
+  evidence when resolving bare call targets, both in post-processing and
+  in `query_graph` (#960, #903).
+- Embedding runs enumerate nodes directly instead of through stored file
+  paths, so legacy stores with non-canonical paths are embedded, and
+  `embed_graph_tool` no longer reports semantic search as active when
+  nothing was embedded (#962).
+- `inheritors_of` marks results found by bare name with
+  `inferred_by: "bare_name"` when several classes or types share that name
+  (#966).
+- `references_to` includes dependents whose import specifier the parser
+  could not resolve (npm workspace alias, tsconfig path mapping), marked
+  `target_resolution: "unresolved"`, when the bare name identifies exactly
+  one node (#969).
+- Source files are read as UTF-8 regardless of the system locale in review
+  and flow snippets and in the eval runner (#928).
+- Watch mode drops events on paths the OS cannot stat instead of ending
+  the watch loop (#959, #897).
+- Watch mode reloads ignore rules when `.code-review-graphignore` or a
+  build manifest changes, removes newly ignored files from the graph,
+  indexes newly included ones, and keeps a source file created at a path
+  previously inferred as build output (#909).
+- Incremental reconciliation refuses a graph whose File markers only partly
+  overlap the requested root, so files of a parent or sibling repository
+  are not deleted (#909).
+- Legacy graph paths are purged by their stored spelling, so normalising
+  them cannot delete a different current row (#911).
+- When promotion to a recursive watch fails, the existing watches are kept
+  and the health file reports `degraded` (#927).
+- A watcher thread that dies before the first liveness tick is detected
+  (#891).
+- `crg-daemon stop` keeps the PID file until the process has exited and
+  exits non-zero if it is still running (#958).
+- The Qoder skills are bundled in the wheel, so `install --platform qoder`
+  works from a pip install and never copies the target project's own
+  `skills/` directory. `uninstall` removes those bundled workflows from
+  `.qoder/skills/` too — it derived the list from the target project's own
+  top-level `skills/` directory, which a normal repository does not have, so
+  it removed none of them (#909).
+
+### Upgrade notes
+
+- **Schema version: 9 → 13.** Four migrations land in this release, and they
+  run automatically the first time any command opens the graph:
+  - v10 adds the indexed `nodes.symbol`, back-filled from `qualified_name`.
+  - v11 adds the indexed `edges.target_resolution`, back-filled over every
+    `CALLS` and `REFERENCES` row. It is what the `references_to` entry above
+    means by `target_resolution: "unresolved"`.
+  - v12 adds `nodes_fts_state`, the mirror of the FTS index.
+  - v13 adds `nodes.docstring` and `nodes.name_tokens`, back-fills both —
+    `name_tokens` in a Python loop over every node — then drops and rebuilds
+    `nodes_fts`.
+
+  v13 is a full-table rewrite plus a complete FTS5 rebuild. On a large graph
+  (this release measures kubernetes/kubernetes at 5.36 GB) the first open
+  after upgrading will take a while and is not resumable. Back the database
+  up first if that matters, or delete it and run `code-review-graph build`.
+
+  Rolling back needs a rebuild. Migrations are forward-only, and 2.3.8 has
+  no newer-database check — it opens a v13 graph without complaining and
+  reads it with a v9 reader. This release adds that check, so a 2.3.9 build
+  reading a future schema says so in one line instead.
+- **The VS Code extension has to be repackaged and republished.** Any
+  extension build a user can already have installed rejects a v13 database
+  with "Database was created with a newer version (schema v13). Update the
+  extension." — the only tagged release, `vscode-v0.2.1`, accepts v6, and the
+  untagged 0.2.2 in this repository accepted v9. The extension is versioned
+  and published separately from the Python package, so upgrading the CLI
+  does not upgrade it. This repository now carries 0.3.0, which accepts v13;
+  until that `.vsix` is built and installed, the Code Graph panel will
+  report the error above after the CLI migrates the graph.
+- **Run `code-review-graph build` once to get the parser fixes.** `update`
+  skips any file whose hash is unchanged, and nothing stamps the parser
+  version into the graph, so a file that has not been edited is never
+  re-parsed after an upgrade. Every parse-time fix above — Go and Ruby
+  import resolution, per-specifier Go import lines, Ruby `require` dispatch,
+  Kotlin imports, PHP `include`/`require`, `import a.b as c`, Go receiver
+  comments, Go embedded `INHERITS`, tsconfig `.mts`/`.cts` — changes a file's
+  rows only when that file is re-parsed. `importers_of` on a Go package
+  stays at 0 until then, and the `extra.import_scope` read path has no edges
+  to expand. The search changes are the exception: migration v13 back-fills
+  `nodes.docstring` from what the parser already stored in `extra`, so
+  keyword search improves without a rebuild.
+- **Re-run `code-review-graph install` to pick up the hook and config
+  changes.** The generated pre-commit hook is not self-updating; reinstall
+  is what replaces an earlier release's block with the one that skips
+  automatic checks in a linked worktree.
+- **GitHub Action cache.** The cache key segment moves from `schema9` to
+  `schema13`, so the first run after upgrading restores no graph cache and
+  builds from scratch. Self-hosted runners can delete the old
+  `code-review-graph-schema9-*` entries.
+
+## [2.3.8] - 2026-08-21
+
+### Added
+
+- Empty results from `query_graph`, `get_impact_radius`, and
+  `semantic_search_nodes` now carry a one-sentence `confidence` field saying
+  *why* the count is zero: the target was never indexed, the graph is behind
+  the working tree, a known static-analysis gap applies to that language and
+  query (PHP container resolution and `include`/`require`, JS/TS callbacks and
+  route registration, npm-aliased imports, Java AOP and reflection, Go
+  structural interface satisfaction, C# DI, Python `getattr` and registry
+  decorators), or the zero is a verified real absence. The field is capped at
+  140 characters and is emitted **only** when the result list is empty, so
+  responses that carry results are byte-identical to before. One honest
+  sentence is far cheaper than the wrong conclusion or the repo-wide grep a
+  bare zero provokes (#314, #819, #850, #851).
+- Added a Voyage AI embedding provider (`--provider voyage`, key from
+  `VOYAGE_API_KEY`, opt-in request throttling via
+  `CRG_VOYAGE_MIN_INTERVAL_SEC`). Embeddings are now persisted after each
+  batch for every provider, so an interrupted cloud run keeps completed
+  batches and re-runs skip up-to-date nodes (#783).
+- Added `code-review-graph forget PATH [PATH ...]` to drop already-parsed files
+  from the graph without a full rebuild. Paths may be absolute, relative to the
+  repository root, a directory (every file underneath is dropped), or a glob
+  pattern, and `--dry-run` previews the selection. The result is equivalent to
+  rebuilding the graph without those files: surviving referrers are re-parsed so
+  no edge is left pointing at a deleted node, and flows, communities, the FTS
+  index, and embeddings are all repaired (#678).
+- Added `--platform NAME` to `code-review-graph uninstall` to unbind a single
+  platform's MCP registration while preserving the graph data and every other
+  configured integration. Without `--platform` the command still performs the
+  full uninstall (#678).
+- Added Oracle PL/SQL structural parsing: packages, package bodies, triggers,
+  and PL/SQL-style functions/procedures (`.sql`, `.pls`, `.plb`, `.pks`,
+  `.pkb`, `.pck`, `.prc`, `.fnc`, `.trg`), with package bodies qualified
+  distinctly from their spec (`pkg_name$body`) and nested members qualified
+  by name plus parameter signature (`pkg_name$body.member_name(params)`, so
+  overloaded package members don't collide), plus regex-based CALLS edges
+  between procedures/functions/triggers/package members. The PL/SQL-specific
+  passes (body-span computation, CALLS extraction, packages, triggers) only
+  run for files an Oracle-dialect check confirms are PL/SQL (an Oracle
+  extension, or a content signal like `VARCHAR2`/`%TYPE`/`:NEW.`, checked
+  against comment/string-stripped text) — plain ANSI/T-SQL/MySQL `.sql`
+  files are unaffected. Comments and string-literal contents are blanked
+  before every PL/SQL regex pass runs, so a `;` or `END name;` inside a
+  trailing comment or a dynamic-SQL string literal can't be mistaken for a
+  real terminator, and Oracle's `$`/`#` identifier characters are handled
+  consistently across every pass. Every `CREATE`/`END`-anchored regex
+  requires a leading word boundary (e.g. `RECREATE PROCEDURE` no longer
+  matches as `CREATE PROCEDURE`, `ENDfoo;` no longer matches as `END foo;`),
+  and the forward-declaration/signature scanners are independently
+  comment/string-aware rather than only correct because callers happen to
+  pass pre-cleaned text. The `INSERT INTO` filter used when extracting
+  PL/SQL call edges now checks a bounded lookback window instead of
+  re-scanning the whole preceding body on every call site, keeping call
+  extraction roughly linear instead of quadratic on files with many calls.
+
+### Fixed
+
+- Almost every MCP tool response is now bounded. #849 found `get_affected_flows`
+  returning roughly 247k tokens inside a workflow documented as "5 tool calls,
+  800 tokens total"; measuring all 30 registered tools against a real
+  5.6k-node graph found the same shape in ten more places, several of them on
+  the default path. Each list now carries a hard ceiling, keeps its
+  untruncated total, and reports "showing N of M" in the summary, so a caller
+  can tell a short answer from a truncated one. Four query tools are still
+  unbounded and tracked in #888 (#849, #853, #887).
+- A repository is now one graph however its root is spelled. Every
+  path-valued `--repo` is canonicalized at the CLI boundary, and the full
+  build, incremental update and watch entry points each resolve their root, so
+  `.`, a relative path, a trailing slash, a symlinked path and an absolute
+  path no longer split the graph or reconcile each other away. An incremental
+  run whose stored `File` nodes all belong to a different root is refused with
+  a clear error instead of emptying the graph file by file, while orphan-only
+  cleanup from #861 is unchanged (#889).
+- A repository reached through a symlinked path is watched and indexed instead
+  of silently dropping every filesystem event, both through
+  `code-review-graph watch --repo` and through `serve --auto-watch` (#892).
+- Watch mode no longer registers OS watches inside ignored trees, and no longer
+  keeps running after its filesystem observer dies. Watches are now planned per
+  directory (ignored trees are skipped, the repo root is watched
+  non-recursively, and directories that appear or disappear later are picked up
+  from a per-tick listing rather than from directory events, which macOS never
+  delivers for a child of a non-recursive watch), nested build output such as
+  `moduleA/target/` is ignored when a sibling `pom.xml` proves it is build
+  output — reported at info level and overridable per path with `!path` in
+  `.code-review-graphignore` — and a dead watchdog thread makes the watcher log
+  an error and exit non-zero so the daemon restarts it, while a deleted watch
+  root is merely released. `crg-daemon status` gained a `Watcher` column
+  (ok/partial/stalled/unknown/dead) and last-event age, and the daemon now backs
+  off exponentially between restarts of a watcher that keeps dying (#811).
+- Deleting and recreating a watched directory (`rm -rf src && mkdir src`, or two
+  branch switches in a row) no longer kills the watcher or silently drops the
+  recreated directory from the graph. Watches are tracked by inode rather than
+  by path, so a replacement is released and re-adopted instead of being read as
+  a dead watcher, and a directory adopted after startup is planned the same way
+  startup plans the repository — its own `node_modules` and `target` stay
+  unwatched (#811).
+- `code-review-graph watch --repo .` no longer empties the graph on startup. The
+  watcher resolves its repository root before reconciling, so stored absolute
+  paths are no longer all treated as stale, and a graph built under a genuinely
+  different root is now refused with a clear error instead of being reconciled
+  away file by file (#811).
+- The generated instruction sections no longer tell agents to always use the
+  graph before reading source and to fall back to file search only when the
+  graph misses. Every platform instruction file now carries the same short
+  guardrails: narrow scope with the graph, read the implementation and its
+  tests before a non-trivial change, prefer the source when the two disagree,
+  and treat an empty graph result as possibly unindexed rather than absent.
+  CONTRIBUTING.md also states what a new platform target must include before
+  it will be reviewed (#314).
+- Reinstalling now upgrades an instruction section written by an older release
+  instead of skipping the file because the opening marker was already there,
+  which is what made every wording fix invisible to existing users. Generated
+  sections carry a closing marker so the block has real boundaries; blocks from
+  before that marker existed are matched by their exact recorded text, so
+  anything written around them survives byte for byte. A section someone edited
+  by hand is left alone and named in the install output instead of being
+  overwritten, and `install` now reports created, updated and left-alone files
+  separately (#314, #558).
+- `uninstall` now removes an instruction section written by any past release,
+  not only one written by the running version, so asking for the instructions
+  to go no longer leaves orphaned text behind. It matches the same recorded
+  block texts install uses, clears duplicate blocks, keeps the text on both
+  sides of the block, closes the gap without leaving a run of blank lines, and
+  still refuses to touch a section that was edited by hand (#314).
+- C# receiver calls (`Service.StaticCall()`, `obj.Method()`, `obj?.Method()`)
+  now resolve to canonical method nodes using receiver-type and namespace
+  evidence recorded at parse time, so `callers_of`, `get_impact_radius`, and
+  `tests_for` return real results for C# codebases instead of bare unresolved
+  names (#612).
+- C# namespace-targeted `IMPORTS_FROM` edges now resolve in `get_impact_radius`,
+  `tests_for`, and the `detect_changes` test-gap classification, not just
+  `importers_of` — well-covered C# code is no longer reported as untested
+  (#310, #792).
+- The path alias resolver now reads `jsconfig.json` (with `tsconfig.json`
+  taking precedence), so plain-JS Vue/Nuxt/Vite projects resolve `@/...`
+  imports instead of silently dropping most of the import graph (#776).
+- Qualified names and `file_path` values now always use POSIX forward-slash
+  separators, making graphs separator-stable across operating systems and
+  fixing 15 Windows test failures; `GraphStore.get_node` bridges native-spelling
+  lookups. Graphs built on Windows by earlier versions need a rebuild (#774).
+- A file saved while it is being indexed no longer stays permanently
+  under-indexed: language detection and parsing now use the same byte snapshot
+  that produced the stored `file_hash` (#746).
+- `status` no longer reports stale or phantom languages: the language list is
+  derived from the live indexed-file inventory, and Java-specific resolvers
+  rerun when Java files leave the graph (#474).
+- `visualize` auto mode now also switches to an aggregated view when the
+  rendered edge count exceeds its budget (previously node-count-only, which
+  stalled the D3 force layout on edge-heavy graphs), and falls back to file
+  aggregation when no community data exists (#609).
+- `visualize --serve` now works on offline and filtered networks: the pinned
+  D3 build ships with the package and is loaded same-origin with its SRI hash
+  verified, keeping an SRI-pinned CDN fallback. Placeholder substitution is
+  ordered so repo-derived graph content can never be expanded as template
+  markup (#475).
+- Refreshed `uv.lock` within existing constraints, clearing all disclosed
+  advisories from #665 (mcp 1.29.0, python-multipart 0.0.32, authlib 1.7.2,
+  pyjwt 2.13.0, starlette 1.3.1, cryptography 49.0.0).
+- Swift initializers, deinitializers and subscripts now emit `Function` nodes
+  (#786). `init_declaration`, `deinit_declaration` and `subscript_declaration`
+  are node types distinct from `function_declaration`, so the walker skipped
+  them and attributed the calls in their bodies to the enclosing *File* node —
+  a change inside one initializer read as file-wide blast radius, and
+  `get_impact_radius` on a callee could not trace back to the initializer that
+  calls it. Each is named after its declaration keyword, since the grammar
+  gives none of the three a usable name field (`subscript`'s would be its
+  return type, `deinit`'s is absent).
+- GitHub Copilot auto-detection now requires the Copilot extension and also
+  recognizes the extension bundled with released VS Code installations.
+- C# methods with a non-generic return type are no longer named after that
+  type: `public async Task Foo()` indexed as `Task`, collapsing every such
+  method in a class onto one qualified name (#791).
+- Java method and constructor names now use the grammar `name` field (same
+  approach as C#), instead of walking for the first `identifier` child (#804).
+- Added a post-index Python import resolver using unique module suffixes, so
+  `src/` layouts produce canonical `CALLS` and `TESTED_BY` edges while duplicate
+  package candidates remain explicitly unresolved (#720).
+
+## [2.3.7] - 2026-07-18
+
+**Maintainer-reconciliation release.** This release packages the verified work
+merged since v2.3.6: broader language and framework coverage, safer graph and
+CLI workflows, platform-install hardening, daemon reliability, and the final
+CodeQL security fixes. The four client-validation drafts remain excluded. No
+breaking changes.
+
+### Added
+
+- Expanded CLI-first workflows with CommonJS `require()` parsing, ten focused
+  graph commands, quiet and JSON output, bounded enrichment, and dead-code
+  analysis (PRs #95, #340, and #341).
+- Added safe Java and Spring modeling for request endpoints, WebFlux routes,
+  value-redacted application configuration, scheduled triggers, application
+  events, Lombok constructor injection, runtime callbacks, and method
+  references (PRs #462, #577, #589, #590, and #591).
+- Added repository-bounded PHP/Laravel semantics and Julia qualified-scope
+  parsing, plus evidence-backed typed-member resolution, Python star-import
+  expansion, Python class decorators, and C# inheritance edges (PRs #628,
+  #638, #639, #643, #647, and #649).
+- Added bounded transitive test coverage, opt-in churn risk, weighted
+  impact-radius ranking, and graph provenance on MCP responses (PRs #636,
+  #640, #644, and #646).
+- Added CodeBuddy Code MCP configuration and project skills using its official
+  shared project contract (PR #633).
+- Added Terraform/OpenTofu structural parsing for resources, data sources,
+  modules, variables, outputs, locals, providers, and expression references.
+  References resolve across sibling files in a Terraform module, and local
+  module sources connect to parsed target files (PR #514; Terraform portion of
+  #199).
+- Added Ansible playbook, role, task, handler, notification, include, and role
+  dependency extraction with qualified graph relationships, duplicate-task
+  disambiguation, and ordinary-YAML false-positive guards (PR #415).
+- Added bounded VB.NET structural parsing for namespaces, types, generics,
+  multiline members, properties, calls, inheritance, and interfaces. Same-file
+  targets resolve case-insensitively only when scope evidence is unique, and
+  overloads share one stable graph symbol (replacing PR #517).
+- Expanded SystemVerilog structure with ports, nets, parameters, packages,
+  typedefs, modports, port references, and verification declarations. Function
+  locals are excluded rather than promoted to module globals, and signal nodes
+  no longer pollute function risk, flow, dead-code, or size analyses (PR #522).
+- Corrected Rust trait and `impl` identity, preserving one concrete type across
+  repeated implementation blocks. Nested/aliased `use` trees, `Self` and
+  turbofish calls, and bounded cached Cargo path/workspace dependency resolution
+  now retain their original graph targets (replacing PR #526).
+- Added an explicit local JSON visualization export. The output is written
+  atomically inside the ignored graph data directory and is documented as
+  potentially containing absolute paths and code-structure metadata (PR #449).
+- Functions and classes now retain a bounded, first-paragraph documentation
+  summary in backward-compatible node metadata across Python, JSDoc/Javadoc,
+  C# XML docs, Doxygen, Rust, and Go. Semantic embedding text includes the
+  normalized summary, so behavior-oriented queries no longer depend only on
+  identifier overlap (replacing PR #602, with Stefan Hudici attribution).
+- Explicit provider-and-model-scoped embedding refresh is available on build,
+  update, postprocess, and watch paths. It is default-off, refuses silent
+  provider/model/endpoint migration, remains fail-soft, and purges vectors for
+  deleted or renamed nodes; manual `embed` also purges orphans (replacing PR
+  #599, with Stefan Hudici attribution).
+- Added `code-review-graph uninstall` as a safe, symmetric counterpart to
+  `install` (#482, replacing PR #491). It derives MCP cleanup from the live
+  platform specifications, preserves unrelated shared configuration and JSONC
+  comments, commits shared-file edits with atomic replacement, removes only
+  CRG-owned hook/skill files, requires and normalizes Git/SVN repository roots,
+  enforces repository/home boundaries, and supports dry-run,
+  registered-repository, data-retention, and user-config-retention modes.
+
+### Fixed
+
+- Made minimal-context and review analysis non-blocking, shared changed-file
+  discovery across review tools, bounded automatic repository detection, and
+  cached graph access so MCP requests avoid repeated scans (PRs #394 and #457).
+- Corrected semantic-search mode reporting, skipped unavailable native grammar
+  parsers safely, and surfaced graph staleness, omitted counts, and symbol
+  disambiguation in responses (PRs #458, #459, and #538).
+- Hardened daemon startup and persistence: foreground lifecycle state is ready
+  before serving, generated TOML escapes strings, and Windows PID checks use
+  waitable handles without leaking temporary handles (PRs #630 and #632).
+- Preserved undecodable subprocess output, expanded trailing-slash ignores,
+  retained nested source directories, and excluded AWS CDK synth output without
+  hiding source trees (PRs #566, #583, and #635).
+- Reconciled community detection placement/splitting and restored responsive
+  visualization sizing without changing graph data (PRs #641 and #642).
+- Serialized first-use local embedding dependency imports and model construction
+  across MCP worker threads. POSIX startup remains lazy, failed loads are not
+  cached, and Windows retains its main-thread prewarm (#610, replacing PR #611).
+- PHP scoped/static calls now resolve during parsing when backed by same-file,
+  enclosing-class, import, qualified-name, or namespace evidence. This keeps
+  incremental work bounded to changed files and leaves unrelated globally
+  unique `Class::method` names unresolved (safe subset of PR #568).
+- Incremental Git change discovery now reads NUL-delimited byte output, so
+  Unicode, whitespace, newline, and literal arrow paths are preserved while
+  rename/copy records keep destination-only semantics (PR #618).
+- MCP stdio servers now use thread-based parallel parsing on every platform,
+  preventing inherited transport descriptors from keeping Unix servers and
+  workers alive after host disconnects, while normal non-interactive CLI/CI
+  builds retain the faster process-pool default (PR #615).
+- Bare CALLS targets and TESTED_BY sources are qualified during postprocessing
+  only when same-file or import evidence identifies exactly one node. Query-time
+  fallbacks apply the same rule, preventing unrelated same-named functions from
+  inheriting tests (replacing the unsound subset of PR #601).
+- Corrected TESTED_BY edge direction across graph, refactor, and transitive-test
+  consumers, with a parser-to-store-to-query regression (#527/#559/#598 class).
+- C# receiver calls now capture bare, chained, member, and null-conditional
+  invocations with caller attribution (#612); Kotlin/C# annotations and C#
+  namespace importer resolution—including nested namespaces—are also preserved
+  (#295/#310, PR #353).
+- Restored advertised Zig structure, calls, imports, and test nodes, including
+  TESTED_BY edges for test blocks embedded in ordinary source files (PR #393).
+- Hardened generated skills/configuration: uppercase `SKILL.md` (PR #563),
+  string-safe JSONC plus top-level and nested-container data-preservation guards
+  (#553, PR #354), and portable PATH-aware hooks (PR #565).
+- Packaged documentation remains reachable through the MCP wrapper (#613),
+  Action comments render repository-relative paths, and both visualization
+  templates select the graph SVG specifically (PR #564).
+- **PHP `use` imports now resolve to files** (`importers_of`, impact radius,
+  call disambiguation): PHP `use` statements had no branch in the parser's
+  import extraction and fell through to the raw-text fallback, storing the whole
+  `use ...;` statement as the `IMPORTS_FROM` edge target (e.g.
+  `"use App\Domain\Entity\Job;"`). As a result `importers_of` / `tests_for` /
+  `inheritors_of` and the upstream side of `get_impact_radius` returned nothing
+  for PHP classes, and the unresolved targets also degraded cross-file `CALLS`
+  disambiguation in `resolve_bare_call_targets`. PHP imports are now recorded as
+  fully-qualified names (handling `as` aliases, grouped `use A\{B, C}`, and
+  `use function` / `use const`) and resolved to absolute `.php` paths by walking
+  up from the importing file, mirroring the existing Java resolver. Vendor/global
+  classes with no local file stay as the bare FQN.
+
+### Changed
+
+- Updated supported async, embedding, watchdog, checkout, cache, and Python
+  setup dependencies while keeping the published compatibility bounds explicit
+  (PRs #544, #629, and #631).
+- Fork pull-request reviews now use a least-privilege two-stage workflow, and
+  evaluation configs use larger pinned commits for reproducible measurements
+  (PRs #468 and #634).
+- Build output now exposes post-processing stage timings for performance
+  diagnosis (PR #637).
+
+### Security
+
+- Closed all three open high-severity CodeQL alerts: the PyPI diagnostic now
+  uses the default secure TLS context, URL checks compare parsed hostnames, and
+  visualization tests use structural HTML parsing instead of unsafe regular
+  expressions (PR #657).
+
+## [2.3.6] - 2026-06-10
+
+**Community-response release.** Built from a full audit of every open PR,
+issue, and discussion: community fixes merged with credit, verified defects
+fixed (including two open Windows bugs), benchmark claims made independently
+checkable, and the project's first self-hosted PR review bot — this repo now
+reviews its own pull requests with its own graph. No breaking changes.
+
+### Added
+
+- **Custom languages without forking** (#320): drop a
+  `.code-review-graph/languages.toml` into your repo to index any grammar
+  shipped by tree-sitter-language-pack (extension map + node-type lists,
+  validated and capped, built-ins always win). See docs/CUSTOM_LANGUAGES.md.
+- **GitHub Action** for risk-scored PR review comments: composite `action.yml`
+  builds/restores the graph from CI cache, runs `detect-changes` against the
+  PR base, and upserts a sticky comment with risk table, affected flows, test
+  gaps, and the Token Savings line. Dogfooded on this repo via
+  `.github/workflows/pr-review.yml`. See docs/GITHUB_ACTION.md.
+- **`agent_baseline` eval benchmark**: compares graph queries against a
+  realistic grep-and-read-top-k agent baseline instead of the whole-corpus
+  strawman; wired into all six pinned eval configs.
+- **Co-change ground truth for `impact_accuracy`**: predictions are now also
+  graded against files actually co-changed in the same commit; the legacy
+  metric is explicitly labelled "graph-derived (circular — upper bound)".
+- **Weekly eval CI** (`.github/workflows/eval.yml`): report-only cron run of
+  the two smallest pinned configs with CSV artifacts and a job summary.
+- **docs/FAQ.md**: how CRG compares to LSP, RAG, grep/agentic search, and
+  adjacent tools; when NOT to use it; verification steps; monorepo/worktree
+  and registry guidance. Linked from the README.
+- GitHub issue forms (bug/feature/platform), a PR template mirroring the
+  CONTRIBUTING checklist, and dependabot config for pip + GitHub Actions.
+
+### Fixed
+
+- `store_file_batch` is now guarded against open transactions like its sibling
+  (#489, merged from community PR #529 by @Devilthelegend — thank you).
+- **Windows: `daemon status` no longer crashes with WinError 87** (#511):
+  PID liveness now uses `OpenProcess`/`WaitForSingleObject` on win32 instead
+  of `os.kill(pid, 0)`.
+- **Windows: CLI `detect-changes` mapped 0 functions** (#528): diff paths are
+  now remapped to absolute native paths before node lookup, matching the MCP
+  tool's behavior; also prevents the misleading "~100% token savings" line on
+  an empty result.
+- Eval benchmarks no longer record failed runs as inflated wins: thrown
+  `get_review_context`/`analyze_changes` calls are marked `status=error` and
+  excluded from aggregates instead of producing naive/1 ratios or recall=1.0.
+- Unknown embedding provider names now raise a clear error listing valid
+  providers instead of silently falling back to the local model.
+- The five analysis MCP tools and the wiki-page tool no longer leak SQLite
+  connections (try/finally `store.close()`).
+- `install` git hooks now resolve the real hooks directory via
+  `git rev-parse --git-path hooks`, so linked worktrees and `core.hooksPath`
+  (husky) setups get a working pre-commit hook (#313 residue).
+- Shipped `hooks/hooks.json` and `hooks/session-start.sh` now drain stdin,
+  matching the generated configs (#493 class).
+- `fastmcp` is now capped `<4` so the next major cannot silently break the
+  server (the #488 failure mode).
+
+### Changed
+
+- README benchmarks section now leads with the ~82x median per-question
+  reduction (528x presented as the best case, not the headline), the
+  limitations block is visible instead of collapsed, and "100% impact recall"
+  is reframed as a graph-derived upper bound alongside the new co-change
+  metric.
+- Stale translated READMEs (zh-CN, ja-JP, ko-KR, hi-IN) carry a staleness
+  banner; the zh-CN benchmark captions and docs/USAGE.md no longer contradict
+  the English README.
+- SECURITY.md now points to GitHub private vulnerability reporting as the
+  canonical channel.
+
+## [2.3.5] - 2026-05-25
+
+**Real-time token savings, visible to humans.** The estimated context-savings
+metric introduced in 2.3.4 was JSON-only. In 2.3.5 it surfaces as a clean
+boxed panel on the CLI and is verifiable against a real tokenizer in one
+flag — so when you reach for `code-review-graph` to review a change, you
+can immediately *see* how much of your context window the graph just kept
+out. No breaking changes.
+
+### Added — Token Savings (headline feature)
+
+- **Boxed `Token Savings` panel on every `--brief` CLI call.** Both
+  `code-review-graph detect-changes --brief` and the new
+  `code-review-graph update --brief` print a four-line panel: the full-context
+  baseline, the graph response size, total saved tokens with percent, and a
+  per-category breakdown (Functions / Tests / Risk / Other) that **sums
+  exactly** to the graph response size — no padding, no rounding magic.
+
+  ```text
+  ┌─────────────────────── Token Savings ────────────────────────┐
+  │ Full context would be:     12,921 tokens                     │
+  │ Graph context used:           762 tokens                     │
+  │ Saved:                     12,159 tokens (~94%)              │
+  │ Breakdown: Functions 244 · Tests 191 · Risk 244 · Other 83   │
+  └──────────────────────────────────────────────────────────────┘
+  ```
+
+- **`--verify` flag** cross-checks the displayed numbers against OpenAI's
+  `cl100k_base` tokenizer (the GPT-4 family). Adds a second
+  `Verified (tiktoken)` row to the panel showing the real token counts.
+  Requires `pip install tiktoken`. A one-time calibration across 222 mixed
+  source files (Python/JS/TS/Go/Rust/RST/MD) committed in
+  `docs/REPRODUCING.md` shows the `chars/4` approximation stays within
+  **+0.5%** of real tokens in aggregate; per-repo bias is bounded to ±12%
+  and the **ratio** stays stable because both sides of the divide are
+  equally biased.
+
+- **`code-review-graph update --brief`** — incremental update plus the same
+  risk + Token Savings panel in one command. Distinct from
+  `detect-changes --brief` (which is read-only against the existing graph).
+  Use `update --brief` when the graph might be stale (post-rebase, large
+  change set); use `detect-changes --brief` when hooks/`crg-daemon` have
+  already kept the graph fresh.
+
+### Added — Reproducible benchmarks
+
+- **`docs/REPRODUCING.md`** — end-to-end reproduction recipe with canonical
+  numbers, the tiktoken calibration table, and an explicit explanation of
+  the three different "token" benchmarks in the codebase and what each
+  measures. Two people running the recipe on different machines on
+  different days now produce **identical** numbers, within float rounding.
+- **`multi_hop_retrieval` benchmark** — 11 hand-curated 2-step tool-chain
+  tasks (semantic_search → query_graph) across the 6 test repos. Average
+  score **0.909**. Per-task CSV in `evaluate/results/`.
+- **`code-review-graph embed` CLI subcommand** — explicit shell-level access
+  to embedding generation. Previously only reachable via MCP, which made
+  the benchmark recipe awkward.
+
+### Changed — Deterministic eval pipeline
+
+- **Every config under `code_review_graph/eval/configs/*.yaml` now pins an
+  upstream SHA.** Previously every config used `commit: HEAD`, which made
+  benchmarks drift whenever upstream pushed. Pinned SHAs: express
+  `b4ab7d65`, fastapi `0227991a`, flask `a29f88ce`, gin `5c00df8a`, httpx
+  `b55d4635`, code-review-graph `84bde354`.
+- **`nextjs.yaml` renamed to `code-review-graph.yaml`.** The historical
+  "nextjs" entry pointed at this repo, not a Next.js codebase. Renamed to
+  match reality.
+- **`eval/runner.py` uses full clones with explicit `returncode` checks.**
+  Previously `--depth 50` silently fell back to `HEAD~1..HEAD` whenever a
+  pinned test-commit SHA was past the shallow window, producing benchmark
+  numbers tied to whichever HEAD the clone happened to grab.
+- **Leiden community detection seeded** (`CRG_LEIDEN_SEED`, default `42`).
+  Previously unseeded — community IDs and sizes drifted run-to-run on the
+  same graph, breaking benchmark comparability.
+- **`eval/runner.py` resolves repo paths absolutely before storing.** The
+  parser previously stored file_path as the path you passed in, so eval
+  builds and CLI/MCP builds could disagree, producing duplicate nodes for
+  the same source location. Fixed by `.resolve()` in the runner.
+- **`eval/runner.py` calls `run_post_processing` after `full_build`.**
+  Previously the eval framework left FTS5 unpopulated (shadow tables
+  `nodes_fts_idx` and `nodes_fts_docsize` empty), so downstream search and
+  multi-hop benchmarks silently returned no results.
+
+### Changed — Search and embeddings
+
+- **`embeddings._node_to_text` is richer.** Embedded text per node now
+  includes the dotted form (`Parent.name`, e.g. `APIRoute.get_route_handler`),
+  the identifier split into words (`get route handler`), and the enclosing
+  module directory (`routing`, `dependencies`). Forces an automatic
+  re-embedding because the text hash changes. Lifts multi-hop benchmark
+  accuracy from **0.545 → 0.818**.
+- **Identifier-aware search boost** (`search.extract_query_identifiers`).
+  Natural-language queries like *"Who advances the gin middleware chain
+  via Context.Next"* now have their dotted / snake_case / CamelCase tokens
+  extracted and used to boost matching qualified-names by 2.0× in hybrid
+  search. Combined with the richer embed text, multi-hop accuracy reaches
+  **0.909** (10 of 11 tasks pass).
+
+### Fixed
+
+- **Test-gap dedup in the brief summary.** If duplicate `qualified_names`
+  ever slip into the graph (e.g. after a path-normalization mismatch),
+  the `Untested:` line in the human summary now collapses to unique names.
+  The underlying `test_gaps` list still carries every entry.
+- **`token_benchmark.py` warns when embeddings are missing.** The standalone
+  benchmark's default NL questions need semantic search to match anything;
+  without embeddings the benchmark used to silently report 0× reduction
+  ratios. Now logs an explicit warning pointing users to `embed`.
+
+### Documentation
+
+- **`docs/REPRODUCING.md`** (new). End-to-end recipe, canonical numbers,
+  the tiktoken calibration table, and a side-by-side explanation of the
+  three "token" benchmarks in the codebase.
+- **`README.md` Token Savings section** (new collapsible block under
+  Usage). Plain-English explanation of `detect-changes --brief` vs
+  `update --brief` — read-only vs re-parses-first — with a side-by-side
+  decision table.
+- **`docs/COMMANDS.md`** lists the new `--brief`, `--verify`, and `embed`
+  forms with an inline "which one?" comment block on the analysis pair.
+- **Updated benchmark headline** to reflect today's pinned-SHA snapshot:
+  range **38× – 528×** (median ~82×) across the 6 repos, **100% impact
+  recall**, **F1 0.71** across 13 commits. Old numbers (73× – 895×)
+  reflected pre-fix conditions (leftover build artifacts, smaller graph
+  responses) and have been superseded.
+- **9 Excalidraw diagrams** regenerated with current canonical numbers
+  (`diagrams/*.excalidraw`, source kept locally; PNG re-exports manual).
+
+### Demo
+
+- **`diagrams/context-savings-demo.gif`** — 44 s screencast showing both
+  CLI surfaces and the `--verify` cross-check. Rendered from
+  `diagrams/context-savings-demo.tape` (regenerable with `vhs`).
+
+## [2.3.4] - 2026-05-25
+
+Focused reliability and token-efficiency release for MCP/CLI review workflows. No breaking changes.
+
+### Added
+
+- **Estimated context savings metadata** for graph-filtered review/impact/architecture responses. The new `context_savings` field is intentionally compact (`estimated`, `saved_tokens`, `saved_percent`) and uses the existing conservative character-count approximation rather than claiming exact tokenization.
+- **CLI estimated savings line** for `code-review-graph detect-changes --brief`; full JSON output includes the same compact `context_savings` metadata.
+
+### Changed
+
+- **Architecture overview is compact by default**: `get_architecture_overview_tool` now defaults to `detail_level="minimal"`, dropping per-community member lists and aggregating cross-community edges by community pair. Full per-edge output remains available with `detail_level="standard"`.
+- **Bounded change analysis**: `detect_changes_tool` can now cap very large changed-function and transitive-test frontiers with `CRG_MAX_CHANGED_FUNCS` and `CRG_MAX_TRANSITIVE_FRONTIER`, and can return a structured timeout error via `CRG_TOOL_TIMEOUT`.
+
+### Fixed
+
+- **Windows semantic search deadlock** (#508/#507): local embedding models are pre-warmed on the main thread on Windows before FastMCP starts worker dispatch.
+- **Rust test detection** (#503/#502): Rust `#[test]` and common async test attributes now produce `Test` nodes.
+- **Generated hook stdin handling** (#494/#493): Codex and Claude hook commands drain stdin to avoid caller-side broken pipes on large hook payloads.
+- **Cross-file callers** (#486/#472): `callers_of` now returns cross-file callers even when same-file callers exist.
+- **Graph path lookup** (#469): review, impact, and file-summary tools resolve user-facing paths to the path format stored in the graph.
+- **Bundled MCP docs** (#485/#480): `get_docs_section` can load the packaged `LLM-OPTIMIZED-REFERENCE.md` from installed wheels.
+- **Local embedding provider availability** (#484/#448): missing `sentence-transformers` now reports local provider unavailability instead of silently producing zero embeddings.
+- **Dead-code response fields** (#481/#447): dead-code results now include `file_path`, `relative_path`, and `language` while preserving the legacy `file` key.
+- **SVN root validation** (#456): MCP/daemon/registry root validation now accepts `.svn` working copies consistently.
+- **CLI postprocess flags** (#487): `build --skip-postprocess` and `update --skip-flows` no longer run an extra full post-processing pass.
+
+### Documentation
+
+- Updated stale release-facing version references for 2.3.4.
+- Replaced fragile language-count wording with current broad language and notebook support wording.
+- Added the missing VS Code extension `0.2.2` changelog entry without changing the extension package version.
+
+### Tests
+
+- Added regression coverage for compact architecture overview output and #476 mitigation.
+- Added tests for estimated context savings calculation, compact metadata shape, MCP metadata, CLI brief/JSON output, Rust test parsing, hook stdin draining, graph path resolution, dead-code fields, SVN root validation, CLI postprocess flags, embedding availability, and bounded detect-changes behavior.
+
+## [2.3.3] - 2026-05-08
+
+Large additive release accumulated since v2.3.2 — 141 non-merge commits, 8 new languages/extensions, 5 new platform install targets, 6 new framework call resolvers, comprehensive Windows hardening, VS Code accessibility pass, and a full sweep of community PRs.
+
+### Added
+
+#### Languages and extensions
+
+- **Nix support** (flake-aware): `.nix` files are parsed via the `nix` tree-sitter grammar shipped with `tree-sitter-language-pack`. Top-level and nested attrset bindings become `Function` nodes with flattened dotted names (e.g. `packages.default`, `devShells.default`). In `flake.nix`, `inputs.<name>.url = "..."` strings emit `IMPORTS_FROM` edges to the URL; `import <path>` and `callPackage <path> <args>` applications in any `.nix` file emit `IMPORTS_FROM` edges (relative paths are resolved against the caller's directory). Adds 7 tests (`TestNixParsing`) and fixtures `tests/fixtures/sample.nix`, `tests/fixtures/sample_module.nix`.
+- **GDScript support** (Godot, PR #316): `.gd` files are parsed via the `gdscript` tree-sitter grammar. Extracts inner classes (`class Name:`), the file-level `class_name` identity, functions (including `static func`), `extends` parent class as an IMPORTS_FROM edge, direct calls and method calls. Adds 10 tests and `tests/fixtures/sample.gd`.
+- **Verilog / SystemVerilog support** (PR #428): `.v`, `.sv`, `.svh` files parse modules, classes, packages, interfaces, programs, functions, and tasks via the `verilog` tree-sitter grammar. Per-construct extractors with dedicated unit tests.
+- **SQL support** (PR #398): `.sql` files parse `CREATE FUNCTION`, `CREATE PROCEDURE`, `CREATE TABLE`, and `CREATE VIEW` statements; emits CALLS edges for function invocations.
+- **ReScript support** (PR #309/323): `.res`/`.resi` parsing for modules, let-bindings, and external declarations.
+- **`.hh` extension support**: C++ header variants now resolve into the C++ parser path.
+- **`.ksh` extension and shebang-based detection** (PR #276): `.ksh` files parsed as shell; extension-less scripts detected via `#!/usr/bin/env <lang>` shebang lines.
+- **Julia improvements**: parametric constructors, `@enum` declarations, and `public` module exports now produce graph nodes.
+
+#### Platforms and install targets
+
+- **GitHub Copilot platform support** (PR #445): `code-review-graph install --platform copilot` writes Copilot-CLI-compatible MCP config without generating Claude-specific skill artifacts.
+- **Gemini CLI platform support** (PR #391): `--platform gemini-cli` skips Claude skills and writes Gemini-native MCP config.
+- **Qoder platform support** (PR #245): `--platform qoder` adds MCP server registration for Qoder.
+- **OpenCode plugin support** (PR #198 via #366): `--platform opencode` registers the MCP server with the OpenCode plugin manifest.
+- **Cursor hooks support** (PR #196): `install` now writes Cursor hook entries (gated behind `~/.cursor` detection so non-Cursor users are not affected).
+- **Codex install alignment**: native Codex integration path; no Claude skill files generated for Codex targets.
+
+#### MCP server and CLI features
+
+- **`crg-daemon`**: new multi-repo watch daemon that supervises per-repo file watchers via `subprocess.Popen` child processes. Documented in README, COMMANDS.md, and ROADMAP.md. 35 dedicated tests.
+- **Streamable HTTP transport** (PR #277): MCP server can now run over streamable HTTP in addition to stdio.
+- **`serve --tools` flag and `CRG_TOOLS` env var**: MCP tool filtering at startup so callers can expose only the subset they need.
+- **`--repo` precedence and validation in `get_docs_section`** (PR #378): honors `serve --repo` and validates path containment before returning section content.
+- **Search enrichment via PreToolUse hooks** (PR #248): hook-driven search index enrichment ahead of tool calls.
+- **External database directory support**: graph DB can now live on a network filesystem via the existing `CRG_DATA_DIR` mechanism, with the file locking path adjusted accordingly.
+- **SVN support** (PR #255): basic Subversion working-copy detection alongside git for change analysis.
+
+#### Parser and resolver improvements
+
+- **Spring DI call resolution** (PR #413): receiver method calls (`this.userService.find(...)`) resolve through `@Autowired`/constructor-injected fields to the concrete `InjectedType.method`. Emits `INJECTS` edges and stereotype metadata (`@Service`, `@Component`, `@Repository`, `@Controller`); writes fully-qualified `target_qualified` so `callers_of` queries work.
+- **Temporal workflow/activity call resolution**: `WorkflowStub.start(...)` and `ActivityStub.execute(...)` resolve to their concrete workflow/activity implementations.
+- **Kafka consumer/producer detection**: `@KafkaListener`-annotated methods and `KafkaTemplate.send(...)` calls emit `CONSUMES` and `PRODUCES` edges keyed on topic.
+- **Jedi-based Python call resolution** (PR #247): improved cross-file Python call resolution using the Jedi static-analysis library.
+- **Python callback REFERENCES edges** (PR #363): function names passed as callback arguments (`schedule(my_handler)`) now emit `REFERENCES` edges instead of being dropped.
+- **Mocha TDD `suite()` recognition** (PR #423): files using Mocha's TDD interface now classify as tests.
+- **Bun test runtime support** (PR #421): files importing `bun:test` are detected as tests.
+- **`__tests__/` directory detection** (PR #422): all files under `__tests__/` are classified as test files regardless of name.
+
+#### Embeddings
+
+- **OpenAI-compatible embedding provider** (PR #321): pluggable provider supporting OpenAI, Azure OpenAI, and any OpenAI-API-compatible endpoint, with configurable batch size.
+- **Localized embedding READMEs**: provider docs translated for non-English users.
+
+#### Visualization, accessibility, and VS Code extension
+
+- **WCAG 2.1 AA contrast pass**: 4.5:1 minimum text contrast across the standalone HTML and VS Code webview.
+- **Distinct `d3.symbol` shapes per node kind**: colorblind-friendly differentiation in both the standalone visualization and the VS Code webview.
+- **Keyboard navigation**: tab/arrow/enter/escape navigation across nodes, with focus styles and a skip-link to bypass the legend.
+- **ARIA roles and labels**: tooltip, detail panel, legend, search results, communities button, edge-pill keyboard activation, search input label.
+- **Help overlay**: interaction guide for both the standalone HTML and the keyboard-help overlay.
+- **Empty-state webview** in VS Code with a contextual depth slider and tooltip.
+- **Edge filter popover** in the VS Code toolbar — fixes density on narrow panels.
+- **Detail panel relocated to the left** so it no longer occludes top controls; close button restyled to match the toolbar.
+- **CONTAINS edge opacity** raised from 0.08 → 0.14 for visibility on dense graphs.
+- **GitHub Dark palette** unified across the VS Code extension.
+- **`IMPLEMENTS`, `TESTED_BY`, `DEPENDS_ON` edge types** rendered in the standalone HTML visualization.
+
+### Fixed
+
+#### `__version__` reporting
+
+- **`code_review_graph.__version__` now matches `pyproject.toml`** (was `2.1.0` since the v2.1.0 release). The User-Agent header that `embeddings.py` sends on cloud HTTP requests is built from this string, so cloud-embedding traffic was being mis-attributed across all releases between v2.1.0 and v2.3.2.
+
+#### C++ / Java / PHP parsing
+
+- **C++ scoped/destructor/operator method names** (PR #371, PR #403): `void Foo::bar()`, `Foo::~Foo()`, `Foo::operator==(...)` now extract the correct member name instead of the qualifier or the operator token.
+- **Java method name extraction** (PR #275): method names are now read from the `identifier` child of `method_declaration` rather than the return-type child (which was producing names like `int64`).
+- **Java superclass / super-interfaces** (PR #278): `extends Foo` and `implements Bar, Baz` now extract bare type names from the `superclass`/`super_interfaces` AST nodes.
+- **Java import resolution to file paths** (PR #280): `import com.example.foo.Bar` resolves through `src/main/java/...` and configured source roots to the actual file.
+- **PHP `CALL` extraction** (PR #298): method calls (`$obj->foo()`), static calls (`Foo::bar()`), and unqualified function calls now produce CALLS edges.
+- **Module-scope `CALLS` edges** (PR #285): top-level executable statements emit CALLS edges (previously only function/method bodies did).
+
+#### Windows
+
+- **Windows MCP stdio hang on long-running tools** (PR #400, PR #292): thread-pool selection now auto-selects on Windows MCP stdio so build/embed do not deadlock.
+- **Windows MCP stdin hang** (PR #425): all `git`/`svn` subprocesses now run with `stdin=DEVNULL`, preventing the FastMCP-stdio buffer from filling on Windows.
+- **Windows non-UTF-8 locale**: `subprocess.run` calls now pass `encoding="utf-8"` so cp1252 hosts no longer mis-decode git output.
+- **Windows test failures** (PR #274): UTF-8 encoding, CRLF normalization, and `stop_at` boundary handling fixes for Windows CI.
+
+#### Hooks and install
+
+- **Hooks JSON schema** (PR #288): `hooks.json` validation no longer fails on the wrapper layout — `matcher` is required and the wrapper is removed.
+- **Hooks merge instead of overwrite** (PR #114, PR #145, PR #203): `install_hooks` now merges into existing hook arrays and creates a `settings.json.bak` backup before modifying user config.
+- **Pre-commit hook adds `update` command** (PR #315): generated pre-commit hook runs `code-review-graph update` rather than the obsolete subcommand.
+- **Skip hooks gracefully outside git** (PR #293): `install` no longer fails when invoked from a non-git directory.
+- **Poetry / uv environment detection** (PR #287): `install` now generates the correct MCP serve command for projects using Poetry or uv.
+- **Hook quoting and `docs` repo_root** (PR #192): hook commands now quote repo paths with spaces, and the docs repo path is restored on install.
+
+#### MCP server
+
+- **fastmcp 3.x compatibility**: `_apply_tool_filter` restored on fastmcp ≥3, dependency floor bumped to `fastmcp>=3.2.4` to pick up the upstream Windows stdio EOF fixes.
+- **FastMCP banner suppressed for stdio transport** (PR #290): the startup banner no longer corrupts the stdio handshake.
+- **MCP config `cwd`, skills path, and JSONC parsing**: install now writes `cwd` into MCP config, points skills at the correct project path, and tolerates JSONC (comments + trailing commas) in existing config files.
+
+#### SQLite and post-processing
+
+- **SQLite transaction safety, FTS5 sync, and atomic operations** (PR #94, PR #279): nested-transaction handling, FTS5 content-table synchronization, and resource cleanup on error paths.
+- **CLI build/update/watch run post-processing** (PR #98): signatures, FTS, flows, and communities are now refreshed after every CLI graph mutation (was previously only refreshed by the MCP server).
+- **`reconcile()` auto-builds graphs and registers new repos**: cold-start path no longer requires a manual `build` before `reconcile`.
+- **Flow trace adjacency in-memory** (PR #296): `trace_flows` loads adjacency once instead of querying SQLite per hop.
+
+#### Other
+
+- **`UnicodeDecodeError` in `read_text`** (PR #303): all text reads now use `errors="replace"`.
+- **Dead-code callback references** (PR #424): functions referenced as callbacks no longer mis-classify as dead code.
+- **Skills.py table formatting** (PR #302).
+- **Search.py duplicate logger** removed.
+- **`status` command reports alive/dead** from the persisted state file.
+
+### Security
+
+- **Embeddings RCE hardening** (PR #397): remote code execution paths in the embedding provider are gated behind an explicit env var; cloud HTTP requests now send a versioned User-Agent (PR #390) and refuse to mix indexes built with different providers.
+
+### Documentation
+
+- **MCP tools documentation** (PR #306): catalog of all MCP tools with usage examples.
+- **venv usage guide** (PR #307).
+- **Windows setup guide** for Claude Code MCP integration.
+- **pipx / PyPI failure troubleshooting** with a `diagnose_pypi_connectivity.py` diagnostic script.
+- **MseeP.ai badge** added to README (PR #399).
+
+### Maintenance
+
+- **Beads (`bd`) issue tracking** initialized for the project (`bd prime` for workflow context).
+- **iCloud sync duplicate files** removed from the working tree.
+- **Working spec docs** moved out of git (already in `.gitignore`).
+- **CI lint and test failures** swept across multiple merged PRs.
+
+### Upgrade notes
+
+- `uvx --reinstall code-review-graph` or `pip install -U code-review-graph`.
+- Re-run `code-review-graph install` once after upgrading to pick up the JSONC-tolerant config writer and the corrected `cwd` / skills path in `.mcp.json`.
+- The `__version__` fix changes the User-Agent string emitted by cloud embedding providers from `code-review-graph/2.1.0` to `code-review-graph/2.3.3`. Anyone allow-listing the old User-Agent on a proxy needs to update their rule.
+- VS Code extension still ships separately — repackage and republish the `.vsix` if you want the v2.3.3 a11y improvements in the Marketplace build.
+
+## [2.3.2] - 2026-04-14
+
+Major feature release — 15 new capabilities, 6 community PRs merged, 6 new MCP tools, 4 new languages, multi-format export, and graph analysis suite.
+
+### Added
+
+- **Hub node detection** (`get_hub_nodes_tool`): find the most-connected nodes in the codebase (architectural hotspots) by in+out degree, excluding File nodes.
+- **Bridge node detection** (`get_bridge_nodes_tool`): find architectural chokepoints via betweenness centrality with sampling approximation for graphs >5000 nodes.
+- **Knowledge gap analysis** (`get_knowledge_gaps_tool`): identify structural weaknesses — isolated nodes, thin communities (<3 members), untested hotspots, and single-file communities.
+- **Surprise scoring** (`get_surprising_connections_tool`): composite scoring for unexpected architectural coupling (cross-community, cross-language, peripheral-to-hub, cross-test-boundary).
+- **Suggested questions** (`get_suggested_questions_tool`): auto-generate prioritized review questions from graph analysis (bridge nodes, untested hubs, surprising connections, thin communities).
+- **BFS/DFS traversal** (`traverse_graph_tool`): free-form graph exploration from any node with configurable depth (1-6) and token budget.
+- **Edge confidence scoring**: three-tier system (EXTRACTED/INFERRED/AMBIGUOUS) with float confidence scores on all edges. Schema migration v9.
+- **Export formats**: GraphML (Gephi/yEd/Cytoscape), Neo4j Cypher statements, Obsidian vault (wikilinks + YAML frontmatter + community pages), SVG static graph. CLI: `visualize --format graphml|cypher|obsidian|svg`.
+- **Graph diff**: snapshot/compare graph state over time — new/removed nodes, edges, community membership changes.
+- **Token reduction benchmark**: measure naive full-corpus tokens vs graph query tokens with per-question reduction ratios.
+- **Memory/feedback loop**: persist Q&A results as markdown for re-ingestion via `save_result` / `list_memories` / `clear_memories`.
+- **Oversized community auto-splitting**: communities exceeding 25% of graph are recursively split via Leiden algorithm.
+- **4 new languages**: Zig, PowerShell, Julia, Svelte SFC (23 total).
+- **Visualization enhancements**: node size scaled by degree, community legend with toggle visibility, improved interactivity.
+- **README translations**: Simplified Chinese, Japanese, Korean, Hindi.
+
+### Merged community PRs
+
+- **#127** (xtfer): SQLite compound edge indexes for query performance.
+- **#184** (realkotob): batch `_compute_summaries` — fixes build hangs on large repos.
+- **#202** (lngyeen): Swift extension detection, inheritance edges, type kind metadata.
+- **#249** (gzenz): community detection resolution scaling (21x speedup), expanded framework patterns, framework-aware dead code detection (56 new tests).
+- **#253** (cwoolum): automatic graph build for new worktrees in Claude Code.
+- **#267** (jindalarpit): Kiro platform support with 9 tests.
+
+### Changed
+
+- MCP tool count: 22 → 28.
+- Schema version: 8 → 9 (edge confidence columns).
+- Community detection uses resolution scaling for large graphs.
+- Risk scoring uses weighted flow criticality and graduated test coverage.
+- Dead code detection is framework-aware (ORM models, Pydantic, CDK constructs filtered).
+- Flow entry points expanded with 30+ framework decorator patterns.
+
+## [2.3.1] - 2026-04-11
+
+Hotfix for the Windows long-running-MCP-tool hang that v2.2.4 only partially fixed.
+
+### Fixed
+- **Windows MCP hang on long-running tools** (PR #231, fixes #46, #136): follow-up to v2.2.4. [@dev-limucc reported on #136](https://github.com/tirth8205/code-review-graph/issues/136) that the `WindowsSelectorEventLoopPolicy` fix from v2.2.4 was necessary but not sufficient — read-only tools worked, but `build_or_update_graph_tool(full_rebuild=True)` and `embed_graph_tool` still hung indefinitely on Windows 11 / Python 3.14. Root cause: FastMCP 2.x dispatches sync handlers inline on the only event-loop thread, so handlers that run for more than a few seconds (especially those that spawn subprocesses or do CPU-bound inference) stop the loop from pumping stdin/stdout. **Fix**: converted the five heavy tools (`build_or_update_graph_tool`, `run_postprocess_tool`, `embed_graph_tool`, `detect_changes_tool`, `generate_wiki_tool`) to `async def` and offloaded the blocking work via `asyncio.to_thread`. The other 19 tools are fast SQLite-read paths and stay sync. Zero config, works on every platform. New regression tests assert the five tools are registered as coroutines AND that each one's source literally contains `asyncio.to_thread` as a defense-in-depth lock-in.
+
+## [2.3.0] - 2026-04-11
+
+Additive feature release — new language parsers, new platform install target, MCP tool UX improvements, and out-of-tree graph storage. No breaking changes from v2.2.4.
+
+### Added
+
+- **Elixir parser** (PR #228, closes #112): `.ex` and `.exs` files now produce modules as Class nodes, `def`/`defp`/`defmacro`/`defmacrop` as Function/Test nodes attached to their enclosing module, `alias`/`import`/`require`/`use` as `IMPORTS_FROM` edges, and everything else as `CALLS` edges. Internal call resolution walks into `do_block` bodies so `MathHelpers.double` correctly resolves its call to `Calculator.compute`.
+- **Objective-C parser** (PR #227, closes #88): `.m` files parse classes (`@interface`, `@implementation`, `@protocol`), instance and class methods, `[receiver message:args]` message expressions, C-style `main()`, and `#import`/`#include`. Multi-part selectors like `add:to:` keep `add` as the canonical method name.
+- **Bash/Shell parser** (PR #227, closes #197): `.sh`, `.bash`, and `.zsh` files parse functions, `command` invocations as `CALLS`, and `source path` / `. path` as `IMPORTS_FROM` edges with path resolution when the target file exists.
+- **Qwen Code as a supported MCP install platform** (PR #227, closes #83): `code-review-graph install --platform qwen` writes a merged `~/.qwen/settings.json` using the same `mcpServers` schema as Cursor/Windsurf — it does not clobber existing Qwen config.
+- **`apply_refactor_tool` dry-run mode** (PR #228, closes #176): new `dry_run: bool = False` parameter on the MCP tool and underlying `apply_refactor()` function. When true, returns a unified diff per file without touching disk and leaves the `refactor_id` valid for a follow-up real apply. Multi-edit files now apply sequentially against updated content in both modes (fixes a subtle bug where separate edits on the same file could stomp each other).
+- **`CRG_DATA_DIR` environment variable** (PR #228, closes #155): when set, replaces the default `<repo>/.code-review-graph` directory verbatim. Useful for ephemeral workspaces, Docker volumes, shared CI caches, and multi-repo orchestrators. Supported by the CLI, MCP tools, and the registry.
+- **`CRG_REPO_ROOT` environment variable** (PR #228, closes #155): `find_project_root()` now checks `CRG_REPO_ROOT` before the usual git-root walk — useful for anyone scripting the CLI from a cwd outside the target repo.
+- **`install --no-instructions` and `-y`/`--yes` flags** (PR #228, closes #173): new flags on `code-review-graph install` to opt out of the `CLAUDE.md`/`AGENTS.md`/`.cursorrules`/`.windsurfrules` injection entirely (`--no-instructions`) or auto-confirm it without an interactive prompt (`-y`/`--yes`). The CLI also now prints the list of files it will touch before writing, so even without `--dry-run` users see what's coming.
+- **Cloud embeddings stderr warning** (PR #228, closes #174): `get_provider()` now prints an explicit warning to stderr before returning a Google Gemini or MiniMax provider, explaining that source code will be sent to an external API. `CRG_ACCEPT_CLOUD_EMBEDDINGS=1` suppresses the warning for scripted workflows. The warning is on stderr only — it never writes to stdout or reads from stdin, so the MCP stdio transport remains uncorrupted.
+- **TROUBLESHOOTING quick-reference** (PR #228): new top section in `docs/TROUBLESHOOTING.md` covering the four most common support questions — hook schema errors, `command not found` after pip install, project-vs-user scoping, and "built the graph but Claude Code doesn't see it".
+
+### Fixed
+
+- **Multi-edit refactor correctness** (PR #228): when a single `apply_refactor` call had multiple edits targeting the same file, the previous implementation re-read the file once per edit and could silently stomp earlier changes. The plan-computation step now groups edits by file and applies them sequentially against the updated content; this fix applies to both the real-write and the new dry-run path.
+
+### Changed
+
+- `install` and `init` commands now preview instruction-file targets before writing (no-op if nothing would change). This is always-on and does not require `--dry-run`.
+- Default embedding path remains fully local (`sentence-transformers`); no behavior change unless you explicitly opt in to a cloud provider.
+
+### Deprecated
+
+Nothing.
+
+### Security
+
+- The cloud-embedding stderr warning (#174) is a privacy improvement; it does not change the behavior of offline local embeddings, which remain the default.
+
+### Upgrade notes
+
+- Nothing to do beyond `uvx --reinstall code-review-graph` or `pip install -U code-review-graph`. If you're coming from v2.2.2 or earlier, re-run `code-review-graph install` once to pick up the v2.2.3 hook schema rewrite.
+- `CRG_DATA_DIR` is optional — if you don't set it, graphs continue to live at `<repo>/.code-review-graph` as before.
+- VS Code extension v0.2.2 (from v2.2.4) still needs to be **repackaged and republished** separately; the PyPI `publish.yml` workflow does not cover it.
+
+### Superseded PRs
+
+- PR #204 (install preview, @lngyeen) — reimplemented cleanly in #228 with `isatty()`-guarded confirmation.
+- PR #207 (`CRG_DATA_DIR`/`CRG_REPO_ROOT`, @yashmewada9618) — reimplemented cleanly in #228 without `input()`-on-stdio and `mcp._local_only` fragility.
+- PR #179 (cloud embeddings warning, @Bakul2006) — reimplemented cleanly in #228 with stderr-only messaging and no stdio reads.
+
+Credit to @lngyeen, @yashmewada9618, and @Bakul2006 for the original designs.
+
+## [2.2.4] - 2026-04-11
+
+Ships the 11 bugs from PR #222 plus the `v2.2.3.1` smoke-test hotfixes, for users upgrading directly from `v2.2.3` or earlier.
+
+### Security
+- **fastmcp bumped from 1.0 → ≥2.14.0** (PR #222, fixes #139, #195): closes CVE-2025-62800 (XSS), CVE-2025-62801 (command injection via server_name), CVE-2025-66416 (Confused Deputy). Transitively drops the `docket → fakeredis` chain that was broken by a `FakeConnection` → `FakeRedisConnection` rename in recent fakeredis releases (#195). The FastMCP public API (`FastMCP(name, instructions=...)`, `@mcp.tool()`, `@mcp.prompt()`, `mcp.run(transport="stdio")`) is unchanged across the 1 → 2 bump, so no source changes were needed beyond the pin. All 24 tools verified to register on fastmcp 2.14.6 and round-trip real per-repo data via stdio MCP in a 6-repo smoke test.
+
+### Fixed
+- **Windows build/embed hangs** (PR #222, fixes #46, #136): `main()` now sets `WindowsSelectorEventLoopPolicy` before `mcp.run()` on `sys.platform == "win32"`. The default `ProactorEventLoop` on Windows Python 3.8+ deadlocks with `ProcessPoolExecutor` (used by `full_build`) over a stdio MCP transport — producing the silent "Synthesizing…" hangs on `build` and `embed_graph_tool`. This is a no-op on macOS/Linux. **Note**: the fix was applied blind; maintainer could not verify on Windows. Please open a fresh issue if you still see a hang on v2.2.4 Windows with either `sentence-transformers` or Gemini providers.
+- **Go method receivers** (PR #222, fixes #190): `func (s *T) Foo()` now attaches `Foo` to `T` as a member (`parent_name="T"`) with the usual `CONTAINS` edge instead of appearing as a top-level function. New `_get_go_receiver_type()` helper walks the method_declaration's first parameter_list to extract the receiver type name.
+- **Dart parser — three bugs** (PR #222, fixes #87):
+  - Dart `CALLS` edges (`_extract_dart_calls_from_children()`) — tree-sitter-dart doesn't wrap calls in a single `call_expression` node; the pattern is `identifier + selector > argument_part`. New walker handles both direct (`print('x')`) and method-chained (`obj.foo()`) shapes.
+  - Dart `package:` URI resolution in `_do_resolve_module()` — `package:<pkgname>/<sub_path>` now walks up to a `pubspec.yaml` whose `name:` declaration matches `<pkgname>` and resolves to `<root>/lib/<sub_path>`.
+  - `inheritors_of` bare-vs-qualified name mismatch in `tools/query.py` — falls back to `search_edges_by_target_name(node.name, kind=...)` for `INHERITS`/`IMPLEMENTS` when the qualified-name lookup returns nothing. Affects all languages (INHERITS targets are stored as bare strings for every language), not just Dart.
+- **Nested `node_modules` and framework ignore defaults** (PR #222, fixes #91): `_should_ignore()` now treats single-segment `<dir>/**` patterns as "this directory at any depth", so `node_modules/**` also matches `packages/app/node_modules/react/index.js` inside monorepos. Extended `DEFAULT_IGNORE_PATTERNS` with Laravel/Composer (`vendor/**`, `bootstrap/cache/**`, `public/build/**`), Ruby (`.bundle/**`), Gradle (`.gradle/**`, `*.jar`), Flutter/Dart (`.dart_tool/**`, `.pub-cache/**`), and generic `coverage/**`, `.cache/**`. Deliberately did **not** add `packages/**` or `bin/**`/`obj/**` — those are false positives in yarn/pnpm workspace monorepos and .NET source trees respectively.
+- **Bare `except Exception` cleanup** (PR #222, fixes #194): Replaced with specific exception classes + `logger.debug(...)` in 11 files (`cli.py`, `graph.py`, `migrations.py`, `parser.py`, `registry.py`, `tools/context.py`, `tsconfig_resolver.py`, `visualization.py`, `wiki.py`, `eval/benchmarks/search_quality.py`). No behavioral change; debuggability improvement.
+- **Visualization auto-collapse hiding all edges** (PR #222, fixes #132): `visualization.py` no longer unconditionally auto-collapses every File node on page load. Auto-collapse now only kicks in above 2000 nodes — previously any graph above ~300 nodes would silently hide every CALLS/IMPORTS/INHERITS edge because they connect Functions/Classes nested inside the collapsed Files.
+- **`eval` command crashes on `yaml.safe_load`** (PR #222, fixes #212): `eval.runner.load_all_configs()` now calls `_require_yaml()` before reading YAML, so users without `code-review-graph[eval]` installed get `ImportError: pyyaml is required: pip install code-review-graph[eval]` instead of `AttributeError: 'NoneType' object has no attribute 'safe_load'`.
+
+### VS Code extension (0.2.2)
+- **`better-sqlite3` bumped 11.x → 12.x** (PR #222, fixes #218): VS Code 1.115 ships Electron 39 / V8 14.2 which removed `v8::Context::GetIsolate()`, the C++ API used by `better-sqlite3@11`. The extension couldn't activate at all — every command was undefined. `better-sqlite3@12.4.1+` (installs 12.8.0) uses the new V8 API and ships Electron 39 prebuilds. `@types/better-sqlite3: ^7.6.8 → ^7.6.13`, plus type-import adjustments in `src/backend/sqlite.ts` for the `Node16` module resolution and the new CJS `export =` types. Extension version bumped to 0.2.2. **Remember to repackage and republish the `.vsix`** — the existing `publish.yml` workflow only covers PyPI.
+
+### Carried forward from 2.2.3.1
+- `serve --repo <X>` is now honored by all 24 MCP tools (was only read by `get_docs_section_tool`). See #223.
+- Wiki slug collisions no longer silently overwrite pages (~70% data loss on real repos). See #223.
+
+### Upgrade notes
+- `uvx --reinstall code-review-graph` or `pip install -U code-review-graph`, then re-run `code-review-graph install` (the 2.2.3 hook-schema rewrite is still a requirement if you're coming from 2.2.2 or earlier).
+- VS Code extension needs to be repackaged + republished separately; the Python release does not include it.
+
+## [2.2.3.1] - 2026-04-11
+
+Hotfix on top of 2.2.3 for two bugs surfaced by a full first-time-user smoke test against six real OSS repos (express, fastapi, flask, gin, httpx, next.js).
+
+### Fixed
+- **`serve --repo <X>` was ignored by 21 of 24 MCP tools** (PR #223): `main.py` captured the `--repo` CLI flag into `_default_repo_root`, but only `get_docs_section_tool` read it. The other 21 `@mcp.tool()` wrappers all took `repo_root: Optional[str] = None` and passed that straight through to the impl, which fell back to `find_repo_root()` from cwd. The real-world blast radius is small — the `install` command writes `.mcp.json` without a `--repo` flag and Claude Code launches the server with `cwd=<repo>` — but anyone scripting `serve` manually or running a multi-repo orchestrator would silently get the wrong graph. Added a single `_resolve_repo_root()` helper with explicit precedence (client arg > `--repo` flag > `None → cwd`) and threaded it through all 24 wrappers. New unit tests cover the precedence rules.
+- **Wiki slug collisions silently overwrote pages** (PR #223): `_slugify()` folds non-alphanumerics to dashes and truncates to 80 chars, so similar community names collided (`"Data Processing"`, `"data processing"`, `"Data  Processing"` all → `data-processing.md`). `generate_wiki()` wrote each community to `<slug>.md` regardless, so later iterations overwrote earlier files while the counter reported them as "updated". On the express smoke test this was **~70% silent data loss** (32 real files vs 107 claimed pages). Fixed by tracking used slugs per-run and appending `-2`, `-3`, … until unique. Every community now gets its own page; the counter matches the physical file count; `get_wiki_page()` still resolves by name via the existing partial-match fallback. New regression test monkey-patches three colliding names and asserts no content loss.
+
+## [2.2.3] - 2026-04-11
+
+### Fixed
+- **Claude Code hook schema** (PR #208, fixes #97, #138, #163, #168, #172, #182, #188, #191, #201): `generate_hooks_config()` now emits the valid v1.x+ Claude Code schema — every hook entry has `matcher` + a nested `hooks: [{type, command, timeout}]` array, and timeouts are in seconds. The invalid `PreCommit` event has been removed; pre-commit checks are now installed as a real git hook via `install_git_hook()`. Users upgrading from 2.2.2 must re-run `code-review-graph install` to rewrite `.claude/settings.json`.
+- **SQLite transaction nesting** (PR #205, fixes #110, #135, #181): `GraphStore.__init__` now connects with `isolation_level=None`, disabling Python's implicit transactions that were the root cause of `sqlite3.OperationalError: cannot start a transaction within a transaction` on `update`. `store_file_nodes_edges` adds a defensive `in_transaction` flush before `BEGIN IMMEDIATE`.
+- **Go method receivers** (PR #166): `_extract_name_from_node` now resolves Go method names from `field_identifier` inside `method_declaration`, fixing method names that were previously picked up as the result type (e.g. `int64`) instead of the method name.
+- **UTF-8 decode errors in `detect_changes`** (PR #170, fixes #169): Diff parsing now uses `errors="replace"` so diffs containing binary files no longer crash the tool.
+- **`--platform` target scope** (PR #142, fixes #133): `code-review-graph install --platform <target>` now correctly filters skills, hooks, and instruction files so you only get configuration for the requested platform.
+- **Large-repo community detection hangs** (PR #213, PR #183): Removed recursive sub-community splitting, capped Leiden at `n_iterations=2`, and batched `store_communities` writes. 100k+ node graphs no longer hang in `_compute_summaries`.
+- **CI**: ruff lint + `tomllib` on Python 3.10 (PR #220) — `tests/test_skills.py` now uses a conditional `tomli` backport on 3.10, `N806`/`E501`/`W291` fixes in `skills.py`/`communities.py`/`parser.py`, and the embedded `noqa` reference in `visualization.py` was rephrased so ruff stops parsing it as a directive.
+- **Missing dev dependencies** (PR #159): `pytest-cov` added to dev extras, 50 ruff errors swept, one failing test fixed.
+- **JSX component CALLS edges** (PR #154): JSX component usage now produces CALLS edges so component-to-component relationships appear in the graph.
+
+### Added
+- **Codex platform install support** (PR #177): `code-review-graph install --platform codex` appends a `mcp_servers.code-review-graph` section to `~/.codex/config.toml` without overwriting existing Codex settings.
+- **Luau language support** (PR #165, closes #153): Roblox Luau (`.luau`) parsing — functions, classes, local functions, requires, tests.
+- **REFERENCES edge type** (PR #217): New edge kind for symbol references that aren't direct calls (map/dispatch lookups, string-keyed handlers), including Python and TypeScript patterns.
+- **`recurse_submodules` build option** (PR #215): Build/update can now optionally recurse into git submodules.
+- **`.gitignore` default for `.code-review-graph/`** (PR #185): Fresh installs automatically add the SQLite DB directory to `.gitignore` so the database isn't accidentally committed.
+- **Clearer gitignore docs** (PR #171, closes #157): Documentation now spells out that `code-review-graph` already respects `.gitignore` via `git ls-files`.
+
+### Changed
+- Community detection is now bounded — large repos complete in reasonable time instead of hanging indefinitely.
+
+### Fixed
+- **`install_hooks` now merges instead of overwriting** (PR #203, fixes #114): `install_hooks()` previously used `dict.update()` which clobbered any user-defined hooks in `.claude/settings.json`. Now merges new entries into existing hook arrays, preserving user hooks. Creates a backup (`settings.json.bak`) before modification.
+
+## [2.2.2] - 2026-04-08
+
+### Added
+- **Kotlin call extraction**: `simple_identifier` + `navigation_expression` support for Kotlin method calls (PR #107)
+- **JUnit/Kotlin test detection**: Annotation-based test classification (`@Test`, `@ParameterizedTest`, etc.) for Java/Kotlin/C# (PR #107)
+
+### Fixed
+- **Windows encoding crash**: All `write_text`/`read_text` calls in `skills.py` now use `encoding='utf-8'` explicitly (PR #152, fixes #147, #148)
+- **Invalid `--quiet` flag in hooks**: Removed non-existent `--quiet` and `--json` flags from generated hook commands (PR #152, fixes #149)
+
+### Housekeeping
+- Untracked `.claude-plugin/` directory and added to `.gitignore`
+- GitHub issue triage: responded to 30+ issues, closed 14, reviewed 24 PRs
+
+## [2.2.1] - 2026-04-07
+
+### Added
+- **Parallel parsing**: `ProcessPoolExecutor` for 3-5x faster builds (`CRG_PARSE_WORKERS`, `CRG_SERIAL_PARSE`)
+- **Lazy post-processing**: `postprocess="full"|"minimal"|"none"` parameter, `run_postprocess` MCP tool + CLI command
+- **SQLite-native BFS**: Recursive CTE replaces NetworkX for impact analysis (`CRG_BFS_ENGINE`)
+- **Configurable limits**: `CRG_MAX_IMPACT_NODES`, `CRG_MAX_IMPACT_DEPTH`, `CRG_MAX_BFS_DEPTH`, `CRG_MAX_SEARCH_RESULTS`
+- **Multi-hop dependents**: N-hop `find_dependents()` with `CRG_DEPENDENT_HOPS` (default 2) and 500-file cap
+- **Token-efficient output**: `detail_level="minimal"` on 8 tools for 40-60% token reduction
+- **`get_minimal_context` tool**: Ultra-compact entry point (~100 tokens) with task-based tool routing
+- **Token-efficient prompts**: All 5 MCP prompts rewritten with minimal-first workflows
+- **Incremental flow/community updates**: `incremental_trace_flows()`, `incremental_detect_communities()`
+- **Visualization aggregation**: Community/file/auto modes with drill-down for large graphs (`--mode`)
+- **Token-efficiency benchmarks**: 5 workflow benchmarks in `eval/token_benchmark.py`
+- **DB schema v6**: Pre-computed `community_summaries`, `flow_snapshots`, `risk_index` tables
+- **Token Efficiency Rules** in all skill templates and CLAUDE.md
+
+### Changed
+- CLI `build`/`update` support `--skip-flows`, `--skip-postprocess` flags
+- PostToolUse hook uses `--skip-flows` for faster incremental updates
+- VS Code extension schema version bumped to v6
+
+### Fixed
+- mypy type errors in parallel parsing and context tool
+- Bandit false positive on prompt preamble string
+- Import sorting in graph.py, main.py, tools/__init__.py
+- Unused imports cleaned up in cli.py
+
+### Housekeeping
+- Gitignore: untrack `marketing-diagram.excalidraw`, `evaluate/results/`, `evaluate/reports/`
+- Updated FEATURES.md, LLM-OPTIMIZED-REFERENCE.md, CHANGELOG.md for v2.2.1
+
+## [2.1.0] - 2026-04-03
+
+### Added
+- **Jupyter notebook parsing**: Parse `.ipynb` files — extract functions, classes, imports across Python, R, and SQL cells
+- **Databricks notebook parsing**: Parse Databricks `.py` notebook exports with `# COMMAND ----------` cell boundaries
+- **Lua language support**: Full parsing for `.lua` files (functions, local functions, method calls, requires) — 20th language
+- **Perl XS support**: Parse `.xs` files with improved Perl call detection and test coverage
+- **Zero-config onboarding**: `install` now sets up skills, hooks, and CLAUDE.md by default so the graph is used automatically
+- **Platform rule injection**: Graph instructions injected into all platform rule files (CLAUDE.md, .cursorrules, etc.) on install
+- **Smart install detection**: Auto-detects whether installed via uvx or pip and generates correct `.mcp.json`
+- **`--platform claude-code` alias**: Accepts both `claude` and `claude-code` as platform names
+
+### Fixed
+- **JS/TS arrow functions indexed**: `const foo = () => {}` and `const bar = function() {}` now correctly appear as nodes (#66)
+- **`importers_of` path resolution**: Normalized with `resolve()` to match stored edge targets (#65)
+- **Custom embedding models**: Support for custom model architectures and restored model param wiring in search (#79)
+
+## [2.0.0] - 2026-03-27
+
+### Added
+- **12 new features**: flows, communities, hybrid search, change analysis, refactoring, hints, prompts, skills, wiki, multi-repo registry, migrations, eval framework
+- **14 new modules** (~10,000 lines): `flows.py`, `communities.py`, `search.py`, `changes.py`, `refactor.py`, `hints.py`, `prompts.py`, `skills.py`, `wiki.py`, `registry.py`, `migrations.py`, `eval/`
+- **15 new MCP tools**: `list_flows`, `get_flow`, `get_affected_flows`, `list_communities`, `get_community`, `get_architecture_overview`, `detect_changes`, `refactor`, `apply_refactor`, `generate_wiki`, `get_wiki_page`, `list_repos`, `cross_repo_search`, `find_large_functions`, `semantic_search_nodes`
+- **5 MCP prompts**: `review_changes`, `architecture_map`, `debug_issue`, `onboard_developer`, `pre_merge_check`
+- **7 new CLI commands**: `detect-changes`, `wiki`, `eval`, `register`, `unregister`, `repos`, `install --skills/--hooks/--all`
+- **Interactive visualization upgrade**: Detail panel, community coloring, flow path highlighting, search-to-zoom, kind filters
+
+### Security
+- Fix path traversal in wiki page reader
+- Add regex allowlist for git ref validation
+- Add explicit SSL context for MiniMax API
+
+### Fixed
+- Fix git diff argument ordering (broke incremental updates)
+- Fix `node_qualified_name` schema mismatch in wiki flow query
+- Batch N+1 queries in `get_impact_radius` and risk scoring
+
+### Architecture
+- Decompose `_extract_from_tree` into 6 focused methods
+- Add 17 public query methods to `GraphStore`
+- Split `tools.py` into 10 themed sub-modules
+
+## [1.8.4] - 2026-03-20
+
+### Added
+- **Vue SFC parsing**: Parse `.vue` Single File Components by extracting `<script>` blocks with automatic `lang="ts"` detection
+- **Solidity support**: Full parsing for `.sol` files (functions, events, modifiers, inheritance)
+- **`find_large_functions_tool`**: New MCP tool to find functions, classes, or files exceeding a line-count threshold
+- **Call target resolution**: Bare call targets resolved to qualified names using same-file definitions (`_resolve_call_targets`)
+- **Multi-word AND search**: `search_nodes` now requires all words to match (case-insensitive)
+- **Impact radius pagination**: `get_impact_radius` returns `truncated` flag, `total_impacted` count, and accepts `max_results` parameter
+
+### Changed
+- Language count updated from 12 to 14 across all documentation
+- MCP tool count updated from 8 to 9 across all documentation
+- VS Code extension updated to v0.2.0 with 5 new commands documented
+
+### Fixed
+- Test assertions updated to handle qualified call targets from `_resolve_call_targets`
+
+## [1.8.3] - 2026-03-20
+
+### Fixed
+- **Parser recursion guard**: Added `_MAX_AST_DEPTH = 180` limit to `_extract_from_tree()` preventing stack overflow on deeply nested ASTs
+- **Module cache bound**: Added `_MODULE_CACHE_MAX = 15_000` with automatic eviction to prevent unbounded memory growth in `_module_file_cache`
+- **Embeddings thread safety**: Added `check_same_thread=False` to `EmbeddingStore` SQLite connection
+- **Embeddings retry logic**: Added `_call_with_retry()` with exponential backoff for Google Gemini API calls
+- **Visualization XSS hardening**: Added `</` to `<\/` replacement in JSON serialization to prevent script injection
+- **CLI error handling**: Split broad `except` into specific `json.JSONDecodeError` and `(KeyError, TypeError)` handlers
+- **Git timeout**: Made configurable via `CRG_GIT_TIMEOUT` environment variable (default 30s)
+
+### Added
+- **Governance files**: Added CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md
+- **Project URLs**: Added Homepage, Repository, Issues, Changelog URLs to pyproject.toml metadata
+
+## [1.8.2] - 2026-03-17
+
+### Fixed
+- **C# parsing broken**: Renamed language identifier from `c_sharp` to `csharp` to match `tree-sitter-language-pack`'s actual identifier. Previously, all C# files were silently skipped because `_get_parser()` swallowed the `LookupError`.
+
+## [1.8.1] - 2026-03-17
+
+### Fixed
+- Add missing `max_nodes` parameter to `get_impact_radius` method signature (caused `NameError` at runtime)
+- Fix `.gitignore` test assertion to match expanded comment format
+
+## [1.8.0] - 2026-03-17
+
+### Security
+- **Prompt injection mitigation**: Node names are now sanitized (control characters stripped, length capped at 256) before appearing in MCP tool responses, preventing graph-laundered prompt injection attacks
+- **Path traversal protection**: `repo_root` parameter now validates that the target directory contains a `.git` or `.code-review-graph` directory, preventing arbitrary file exfiltration via MCP tools
+- **VSCode RCE fix**: `cliPath` setting is now scoped to `machine` level only, preventing malicious workspace settings from pointing to attacker-controlled binaries
+- **XSS fix in visualization**: `escH()` now escapes quotes and backticks in addition to angle brackets, closing stored XSS via crafted node names in generated HTML
+- **SRI for CDN assets**: D3.js script tag now includes `integrity` and `crossorigin` attributes to prevent CDN compromise
+- **Secure nonce generation**: VSCode webview CSP nonces now use `crypto.randomBytes()` instead of `Math.random()`
+- **Symlink protection**: Build, watch mode, and file collection now skip symbolic links to prevent parsing files outside the repository
+- **TOCTOU elimination**: File bytes are now read once, then hashed and parsed from the same buffer, closing the time-of-check-to-time-of-use gap
+
+### Fixed
+- **Thread-safe NetworkX cache**: Added `threading.Lock` around graph cache reads/writes to prevent race conditions between watch mode and MCP request handling
+- **BFS resource limits**: Impact radius traversal now caps at 500 nodes to prevent memory exhaustion on dense graphs
+- **SQL parameter batching**: `get_edges_among` now batches queries to stay under SQLite's variable limit on large node sets
+- **Database path leakage**: Improved `.gitignore` inside `.code-review-graph/` with explicit warnings about absolute paths in the database
+
+### Changed
+- **Pinned dependency bounds**: All dependencies now have upper-bound version constraints to mitigate supply-chain risks
+
+## [1.7.2] - 2026-03-09
+
+### Fixed
+- **Watch mode thread safety**: SQLite connections now use `check_same_thread=False` for Python 3.10/3.11 compatibility with watchdog's background threads
+- **Full rebuild stale data**: `full_build` now purges nodes/edges from files deleted since last build
+- **Removed unused dependency**: `gitpython` was listed in dependencies but never imported — removed to shrink install footprint
+- **Stale Docker reference**: Removed non-existent Docker image suggestion from Python version check
+
+## [1.7.0] - 2026-03-09
+
+### Added
+- **`install` command** — primary entry point for new users (`code-review-graph install`). `init` remains as an alias for backwards compatibility.
+- **`--dry-run` flag** on `install`/`init` — shows what would be written without modifying files
+- **PyPI publish workflow** — GitHub releases now automatically publish to PyPI via API token
+- **Professional README** — complete rewrite with real benchmark data:
+  - Code reviews: 6.8x average token reduction (tested on httpx, FastAPI, Next.js)
+  - Live coding tasks: 14.1x average, up to 49.1x on large repos
+
+### Changed
+- README restructured around the install-and-forget user experience
+- CLI banner now shows `install` as the primary command
+
+## [1.6.4] - 2026-03-06
+
+### Changed
+- **Portable MCP config**: `init` now generates `uvx`-based `.mcp.json` instead of absolute Python paths — works on any machine with `uv` installed
+- Removed `_safe_path` symlink workaround (no longer needed with `uvx`)
+
+## [1.6.3] - 2026-03-06
+
+### Added
+- **SessionStart hook** — Claude Code now automatically prefers graph MCP tools over full codebase scans at the start of every session, saving tokens on general queries
+- `homepage` and `author.url` fields in plugin.json for marketplace discoverability
+
+### Fixed
+- plugin.json schema: renamed `tags` to `keywords`, removed invalid `skills` path (auto-discovered from default location)
+- Removed screenshot placeholder section from README
+
+## [1.6.2] - 2026-02-27
+
+### Fixed
+- **Critical**: Incremental hash comparison bug — `file_hash` read from wrong field, causing every file to re-parse
+- Watch mode `on_deleted` handler now filters by ignore patterns
+- Removed dead code in `full_build` and duplicate `main()` in `incremental.py`
+- `get_staged_and_unstaged` handles git renamed files (`R old -> new`)
+- TROUBLESHOOTING.md hook config path corrected
+
+### Added
+- **Parser: C/C++ support** — full node extraction (structs, classes, functions, includes, calls, inheritance)
+- **Parser: name extraction** fixes for Kotlin/Swift (`simple_identifier`), Ruby (`constant`), C/C++ nested `function_declarator`
+- `GraphStore` context manager (`__enter__`/`__exit__`)
+- `get_all_edges()` and `get_edges_among()` public methods on `GraphStore`
+- NetworkX graph caching with automatic invalidation on writes
+- Subprocess timeout (30s) on all git calls
+- Progress logging every 50 files in full build
+- SHA-256 hashing in embeddings (replaced MD5)
+- Chunked embedding search (`fetchmany(500)`)
+- Batch edge collection in `get_impact_radius` (single SQL query)
+- ARIA labels throughout D3.js visualization
+- **CI**: Coverage enforcement (`--cov-fail-under=50`), bandit security scanning, mypy type checking
+- **Tests**: `test_incremental.py` (24 tests), `test_embeddings.py` (16 tests)
+- **Test fixtures**: C, C++, C#, Ruby, PHP, Kotlin, Swift with multilang test classes
+- **Docs**: API response schemas in COMMANDS.md, ignore patterns in USAGE.md
+
+## [1.5.3] - 2026-02-27
+
+### Fixed
+- `init` now auto-creates symlinks when paths contain spaces (macOS iCloud, OneDrive, etc.)
+- `build`, `status`, `visualize`, `watch` work without a git repository (falls back to cwd)
+- Skills discoverable via plugin.json (`name` field added to SKILL.md frontmatter)
+
+## [1.5.0] - 2026-02-26
+
+### Added
+- **File organization**: All generated files now live in `.code-review-graph/` directory instead of repo root
+  - Auto-created `.gitignore` inside the directory prevents accidental commits
+  - Automatic migration from legacy `.code-review-graph.db` at repo root
+- **Visualization: start collapsed**: Only File nodes visible on load; click to expand children
+- **Visualization: search bar**: Filter nodes by name or qualified name in real-time
+- **Visualization: edge type toggles**: Click legend items to show/hide edge types (Calls, Imports, Inherits, Contains)
+- **Visualization: scale-aware layout**: Force simulation adapts charge, distance, and decay for large graphs (300+ nodes)
+
+### Changed
+- Database path: `.code-review-graph.db` → `.code-review-graph/graph.db`
+- HTML visualization path: `.code-review-graph.html` → `.code-review-graph/graph.html`
+- `.code-review-graph/**` added to default ignore patterns (prevents self-indexing)
+
+### Removed
+- `references/` directory (duplicate of `docs/`, caused stale path references)
+- `agents/` directory (unused, not wired into any code)
+- `settings.json` at repo root (decorative, not loaded by code)
+
+## [1.4.0] - 2026-02-26
+
+### Added
+- `init` command: automatic `.mcp.json` setup for Claude Code integration
+- `visualize` command: interactive D3.js force-directed graph visualization
+- `serve` command: start MCP server directly from CLI
+
+### Changed
+- Comprehensive documentation overhaul across all reference files
+
+## [1.3.0] - 2026-02-26
+
+### Added
+- Universal installation: now works with `pip install code-review-graph[embeddings]` on Python 3.10+
+- CLI entry point (`code-review-graph` command works after normal pip install)
+- Clear Python version check with helpful Docker fallback for older Python users
+- Improved README installation section with one-command + Docker option
+
+### Changed
+- Minimum Python requirement lowered from 3.11 → 3.10 (covers ~90% of users)
+
+### Fixed
+- Installation friction for most developers
